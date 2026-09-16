@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 构建产物
+_build/
+_buildspec/
+_build_release/
+_dist/
+dist/
+*.spec
+*.pkg
+
+# 本地运行时数据（参考谱库、RRUFF 数据包、分析结果都在这里）
+工具数据/
+工具设置.ini
+光谱转换工具_绿色版.zip
+RamanSpectrumToolkit*.zip
+
+# 本地自测与临时文件
+_tmp_*
+_verify*/
+_pkg/
+assets/_shot*.png
+assets/_shot.ps1
