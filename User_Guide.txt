@@ -1,0 +1,702 @@
+﻿Raman Spectrum Toolkit  User Guide
+(JASCO .jws conversion - Raman peak analysis - mineral identification)
+(guide version: 2.0)
+============================================================
+
+In one sentence:
+  Turns JASCO .jws and other spectrum files into readable charts and data,
+  finds and labels peaks, fits them, assigns them to minerals, searches the
+  ROD / RRUFF reference libraries (including identifying spectra whose
+  mineral is unknown), and writes batch conversions and analysis reports.
+
+How to start (the 30-second version)
+  1. Launch the tool: RamanSpectrumToolkit.exe  (or run jws2csv.py with no arguments)
+  2. Click [Add files] and choose your .jws file(s), or run the batch entry
+  3. Look at the chart on the right; peaks are labelled automatically
+  4. Click [Start conversion] and choose Excel / PNG / CSV as needed
+  5. Do not know what the sample is? Use
+     [Analysis -> Unknown-spectrum search (whole-library identification)...]
+
+Marking conventions in this guide
+  [Button]      a button or menu item in the interface
+  ->            menu path, e.g. [Settings -> Advanced settings...]
+  Values such   recommended values are given directly, e.g. "order 5, 20 iterations"
+
+Language
+  The interface, command line and this guide are bilingual (Chinese / English).
+  Switch at [Settings -> Language]; the CLI accepts --lang en|zh.
+  The first launch follows your Windows display language and remembers your choice.
+  Folder names on disk (工具数据 / 参考谱库 / RRUFF数据包 / 分析结果) stay in
+  Chinese so that data folders remain portable between the two modes.
+
+ 1. Five-minute start
+ 2. Interface overview
+ 3. Supported formats
+ 4. What is output, and where
+ 5. Data folder and size management
+ 6. Chart settings and manual peak annotation
+ 7. Preprocessing (baseline, smoothing, spikes, calibration)
+ 8. Peak detection and peak fitting
+ 9. Mineral info and peak assignment
+10. Databases: ROD and RRUFF
+11. Pairing and unknown-spectrum identification
+12. Spectrum arithmetic
+13. Statistics (clustering and 2D imaging)
+14. Batch processing and analysis reports
+15. Advanced settings at a glance
+16. Command-line quick reference
+17. Common tasks
+18. Frequently asked questions
+19. Relation to the RRUFF tools
+
+
+============================================================
+1. Five-minute start
+============================================================
+
+[Step 1] Launch RamanSpectrumToolkit.exe (or run jws2csv.py) to open the window.
+[Step 2] Click [Add files] and choose the .jws you exported from the
+  spectrometer; add a whole folder with [Add folder] if you like
+  (searched recursively for .jws / .csv / .spc / .jdx / .txt / .xlsx).
+[Step 3] Click a file in the left list: the right side draws it at once and
+  labels the detected peaks with their wavenumbers.
+[Step 4] Choose "What to output" (Excel with chart / PNG / CSV / peak list /
+  peak fit / JCAMP-DX), pick an output location, then [Start conversion].
+[Step 5] The log below shows the result, and [Open the output folder] takes
+  you to the files.
+
+Why does the CSV I double-clicked in WPS show only numbers, no chart?
+  A CSV file is plain text: it can hold numbers but not a chart. Please choose
+  "Excel (with chart)" (or PNG) as the output, then the chart is embedded.
+  Excel output needs the openpyxl component, PNG needs Pillow; if a component
+  is missing the tool tells you how to install it (pip install openpyxl).
+
+Peaks were missed
+  Right-click behaviour: left-click on the chart adds a peak manually (blue
+  square), right-click removes the nearest manual peak. Manual peaks are
+  remembered per file and appear in the peak list with source "manual".
+  You can also lower the peak sensitivity threshold in [Advanced settings...].
+
+============================================================
+2. Interface overview
+============================================================
+
+The window is split in two: operations on the left, charts on the right.
+
+Left side
+  [1. Choose files]   add files / add a folder / remove / clear, with the hint
+                     that .jws becomes data+chart and .csv becomes a chart
+  File list          multi-select works (Ctrl / Shift); the preview follows
+  [2. Output location] save next to the source file (recommended) or a folder
+  [3. Header and column names]  write a header row, custom or auto-detected
+                     column names, "skip existing CSV" to avoid overwriting
+  [4. Run log]       progress and per-file results
+
+Right side
+  [Chart settings]   X tick interval (integer, 200 by default), start tick,
+                     hide Y values, grid lines, title, figure size
+  Spectrum preview   up to 8 curves overlaid, [Clear view]
+  [Save preview as PNG]  saves the current view
+
+Menu bar
+  File      batch a folder..., export analysis report..., exit
+  Analysis  unknown-spectrum search (whole-library identification), peak
+            fitting, compare, peak-position search, similarity matrix,
+            clustering, 2D imaging, average, subtract, range replacement,
+            waterfall, spectrum comparison
+  Settings  advanced settings..., mineral info and Raman peak assignment...,
+            data folder..., language
+  Database  search online databases (ROD / RRUFF)..., RRUFF data sources...,
+            open data folders
+  Help      guide (full manual)..., export the guide as TXT..., about
+
+============================================================
+3. Supported formats
+============================================================
+
+Read
+  .jws    JASCO spectra (OLE2 compound document; DataInfo + Y-Data streams,
+          multi-channel supported)
+  .csv    two columns of numbers, optional header; a trailing text column
+          (notes, source) is dropped automatically
+  .spc    Galactic / Thermo SPC (16-bit, 32-bit and float, little endian)
+  .jdx    JCAMP-DX, including ##XFACTOR / ##DELTAX / ##XYPOINTS forms
+  .txt    .dat .asc .xy two-column text
+  .xlsx   .xlsm Excel (needs openpyxl)
+
+Write
+  .xlsx   data plus an embedded scatter chart (ScatterChart with a numeric
+          X axis, so the tick interval really applies)
+  .csv    plain data
+  .png    chart image (1600x900 by default, adjustable)
+  _peaks.csv    peak list (position, intensity, relative intensity, FWHM,
+                prominence, source)
+  _fit.csv      peak fitting results (centre, height, FWHM, area, shape, eta, R2)
+  .jdx    JCAMP-DX export
+
+Notes
+  When a folder is scanned, the tool's own outputs (peak tables, summaries)
+  are recognised and skipped, so they are never mistaken for spectra.
+  Files in the reference library can themselves be selected as references.
+
+============================================================
+4. What is output, and where
+============================================================
+
+Two choices in [2. Output location]:
+  Save next to the source file (recommended)   outputs go beside the .jws
+  A folder I choose                            outputs go to that folder
+
+Analysis results (peak fits, pairing reports, similarity matrices, clustering,
+imaging, reports, unknown-spectrum searches) always go to
+  工具数据/分析结果            inside the tool data folder,
+so your sample folders are never cluttered by analysis output.
+
+File naming
+  Conversion     <name>.xlsx / .csv / .png
+  Peak list      <name>_peaks.csv
+  Peak fit       <name>_fit.csv
+  Batch summary  <folder>_批处理汇总.csv
+  Identification <name>_未知光谱检索.csv  (+ _对比.png overlay)
+  Report         光谱分析报告.html  (self-contained, images embedded)
+
+Tip: peak positions and FWHMs are detected automatically. Please check them
+manually before publication.
+
+============================================================
+5. Data folder and size management
+============================================================
+
+Every file the tool downloads or produces lives in ONE place:
+
+  <tool folder>/RamanSpectrumToolkit.exe
+              User_Guide.txt / 使用说明.txt   (this guide, in EN / ZH)
+              assets/icon.png                 (app icon)
+              <tool folder>/工具数据/
+      ├─ 参考谱库/       reference spectra downloaded from ROD or exported
+      │                  from RRUFF (plain CSV, usable offline)
+      ├─ RRUFF数据包/    downloaded package zips, search index and feature index
+      └─ 分析结果/       peak fits, pairing reports, matrices, imaging, reports
+
+If the tool folder is not writable (for example C:\Program Files, or a
+read-only USB stick) the tool automatically uses
+  %LOCALAPPDATA%\拉曼光谱工具\工具数据
+so it never fails and never writes anywhere else.
+
+Managing it
+  [Settings -> Data folder...] shows the location, the file count and the size
+  of each subfolder, lets you open or clear a folder individually, and lets you
+  move the whole data folder elsewhere (optionally moving the existing data).
+  Size limit: the default is 2 GB; before every download the free disk space is
+  checked and you are warned if the limit would be exceeded. Cleaning up
+  packages also deletes their index and feature index.
+
+Command line
+  --data-dir                 show location, file counts and usage
+  --data-dir D:\my\folder    move the data folder
+  --cache-limit 500          set the limit to 500 MB (0 = unlimited)
+  --cleanup 500              remove packages until 500 MB have been freed
+
+============================================================
+6. Chart settings and manual peak annotation
+============================================================
+
+The [Chart settings] panel on the right refreshes the preview immediately:
+  X tick interval   integer ticks, 200 cm-1 by default (coordinate snapping)
+  Start tick        first labelled tick
+  Show Y values     off by default (intensity is relative, so numbers rarely help)
+  Grid lines        on/off
+  Title             chart title
+  Figure size       PNG pixels, 1600x900 by default
+  Peak labels       label every detected peak; optionally show relative
+                    intensity (%) next to the wavenumber
+
+Manual annotation
+  Left-click the chart   add a peak at the nearest peak top (blue square)
+  Right-click            remove the nearest manual peak
+  [Clear manual peaks]   remove them all for the current file
+  [Undo manual peak]     remove the last one
+  Manual peaks are kept per file and are marked "manual" in the peak list.
+
+When a peak sits on a shoulder, the tool estimates its prominence against a
+local baseline so that the annotation and the table stay sensible.
+
+============================================================
+7. Preprocessing (baseline, smoothing, spikes, calibration)
+============================================================
+
+Everything is in [Settings -> Advanced settings...]. By default preprocessing
+only affects the chart and peak detection; tick "Also apply to exported data"
+if you want it written into the CSV/Excel as well.
+
+Spike removal (cosmic rays / dead pixels)
+  Removes narrow spikes using two conditions (deviation from a moving median
+  beyond a threshold, and deviation relative to the local dynamic range) plus a
+  width limit of three points, so genuine narrow peaks are not flattened.
+  Recommended: window 5, threshold 8-15.
+
+Baseline
+  linear                  straight line between the two end regions
+  polynomial (order 2)    least squares, good for gentle backgrounds
+  iterative polynomial    repeatedly fit and drop points above the baseline to
+                          follow the valley floor; recommended for strong
+                          fluorescence: order 5, 20 iterations
+  rolling minimum         centred moving minimum, window in cm-1
+  rolling ball            morphological opening, similar but smoother
+  none
+
+Smoothing
+  moving average, or Savitzky-Golay (preserves peak height and width better).
+  Window in points; 3-7 is usually enough. 1 in the SG order box means no
+  smoothing.
+
+Derivative
+  first or second derivative (Savitzky-Golay based; linear extrapolation at the
+  borders so linear signals stay exact).
+
+Normalization
+  none / max = 1 / min-max.
+
+Raman shift calibration
+  Measured peak -> standard peak. One pair performs a shift; two pairs also
+  scale the axis. Example 520.6 -> 520.7 (silicon).
+
+============================================================
+8. Peak detection and peak fitting
+============================================================
+
+How peaks are found
+  A moving average suppresses noise, the noise level is estimated with the MAD
+  (median absolute deviation), and a peak must exceed
+  max(3 x noise, sensitivity% x intensity range) with a minimum separation in
+  cm-1. Default sensitivity is 7% of the intensity range; lower it to find
+  smaller peaks. Every peak gets position, intensity, relative intensity (%),
+  FWHM, prominence and source.
+
+Peak fitting
+  [Analysis -> Peak fitting (selected files)...] chooses Gaussian, Lorentzian
+  or pseudo-Voigt per peak. The result contains the fitted centre, height,
+  FWHM, area, shape, mixing coefficient eta and R2, and is written to
+  <name>_fit.csv.
+
+Peak-position search
+  [Analysis -> Peak-position search (reference peak table)...] matches the peak
+  table of the spectrum against your own reference table (CSV: name, peak1,
+  peak2, ...) with a 5 cm-1 tolerance and ranks the candidates.
+
+Peak list
+  [File -> ...] or the conversion options write <name>_peaks.csv; if an
+  assignment reference is set, the table gains an "assignment" column.
+
+============================================================
+9. Mineral info and peak assignment
+============================================================
+
+[Settings -> Mineral info and Raman peak assignment...]
+
+  Built-in table: 48 common minerals with 224 characteristic peaks and
+  vibrational assignments (e.g. v3(SiO4)). It works offline.
+  Search by name, by chemical formula, or by elements (for example "Zr Si",
+  meaning all of these elements must be present).
+
+  Selecting a row shows the formula, crystal system, element list and
+  characteristic peaks. [Use as peak-assignment reference] makes it the
+  reference for the current session: the peak list, the batch summary and the
+  HTML report then contain an "assignment" column.
+
+  Assignments use a tolerance of 8 cm-1 and are a guide only.
+
+  RRUFF sample records: if a matching RRUFF package is downloaded, the info
+  panel also shows the real sample record - ideal formula, measured formula,
+  cell parameters and crystal system, locality, identification status and a
+  data link.
+
+============================================================
+10. Databases: ROD and RRUFF
+============================================================
+
+Two data sources
+  ROD (Raman Open Database)  the open Raman database of the RRUFF project;
+      searched online, one spectrum at a time
+  RRUFF data packages        the official zipped collections at
+      www.rruff.net/zipped_data_files (Raman by quality grade, plus IR, XRD and
+      chemistry packages)
+
+Three steps in the GUI ([Database -> RRUFF data sources...])
+  1. Tick the packages you want and download them (the index is built
+     automatically). Packages range from 12 MB (unrated, about 600 spectra) to
+     229 MB. Prefer the "fair / excellent" grades for better spectra.
+  2. Search by mineral name or RRUFF ID (for example Zircon or R050034), then
+     download the selected spectra or bulk-fetch by mineral.
+  3. Export to the local reference library, then plot / pair-compare.
+
+Where the files go
+  Everything is stored under 工具数据 (see chapter 5): the package zips and the
+  indexes in RRUFF数据包, the exported reference spectra (plain CSV) in 参考谱库.
+  You can also import a zip you downloaded yourself, and IR / XRD / chemistry
+  packages are kept in separate subfolders so that spectra of different kinds
+  are never mixed up during matching.
+
+An index is built when a package is downloaded; you can rebuild it with
+[Database -> ...] or with --identify-index. Deleting a package also deletes its
+indexes.
+
+============================================================
+11. Pairing and unknown-spectrum identification
+============================================================
+
+Unknown-spectrum search (whole-library identification, no mineral name needed)
+
+  You have a spectrum and no idea what it is? Use this:
+  [Analysis -> Unknown-spectrum search (whole-library identification)...]
+
+  Step 1  Build the feature index (once). It extracts the peak positions,
+    relative intensities, ideal formula and crystal system of every spectrum in
+    the packages (about 2 seconds for 600 spectra) and caches the result.
+    Tick the packages and click [Build / update feature index].
+  Step 2  Choose the unknown spectrum. It is taken automatically from the
+    selection on the left; [Choose a file...] picks any file directly
+    (.jws / .csv / .spc / .jdx / .txt).
+  Step 3  Click [Search]. The tool matches the peaks of the unknown spectrum
+    against the whole library (fast index pass), then re-scores the top
+    candidates from their raw spectra, and lists candidate minerals by
+    confidence.
+
+  What the columns mean
+    Score       0.5 x F1 + 0.5 x strong-peak hit rate, used for ranking
+    F1          peak-position match F1 (5 cm-1 tolerance; 0 if fewer than 2 hits)
+    Strong hits how many of the 3 strongest peaks of the unknown were found
+    Hits/ref    matched peaks / peaks of that reference
+    Mean dev    mean position difference (1-3 cm-1 is normal)
+    Correlation curve-shape similarity (only for re-scored candidates)
+    Library     how many spectra of that mineral exist in the library
+    Chance      probability that a coincidence would match this well
+
+  How to read the conclusion (three levels)
+    Reliable candidate  score >= 60, at least 2 strong-peak hits AND clearly
+                        ahead of the runner-up (>= 15 points)
+    Possible candidate  score >= 35 but the evidence is weaker; if the top
+                        scores are very close the tool says so explicitly and
+                        reminds you that the mineral may simply not be in the
+                        library
+    Not found           best score < 35
+  An unnamed library record ("unknown") is never used to name your mineral; if
+  one is spectrally closer it is reported separately with its peak positions as
+  a phase clue.
+
+  Tips
+    - If you have EDS / microprobe data, fill in "must contain elements" /
+      "must not contain" (e.g. Zr Si) to narrow the search a lot.
+    - Search type defaults to Raman; IR, XRD and chemistry packages are
+      separate and should not be mixed.
+    - Library quality matters: unrated / poor packages are noisy, so download a
+      fair / excellent package when accuracy matters.
+    - [Export selected to the reference library] and [Pair report with the
+      candidate] let you inspect the peak comparison table yourself.
+
+  Command line
+    --identify FILE --identify-top 12           search (top 20 re-scored)
+    --identify-must "Zr Si" --identify-not Ca   element filter
+    --identify-kind Raman|IR|XRD|all            restrict the search type
+    --identify-index [PACKAGE_KEY]              build / rebuild the feature index
+    --identify-all                              list every spectrum, not per mineral
+    --identify-no-exact                         index pass only (faster)
+
+Pairing (manual / automatic)
+
+  [Analysis -> Pairing (manual / auto)] compares measured spectra against
+  reference spectra; auto-pairing can search online and download candidates
+  first. Scoring is peak-match F1 (the primary criterion, with a minimum of two
+  matched peaks so that peak-rich references cannot win by coincidence),
+  followed by the correlation coefficient and the spectral angle. The result is
+  a ranking CSV plus a pairing report PNG that shows the overlaid curves, the
+  matched peaks, the ranking table and the peak comparison table.
+
+============================================================
+12. Spectrum arithmetic
+============================================================
+
+All in the [Analysis] menu.
+
+  Average selected spectra     mean of the selected spectra on a common grid
+  Subtract spectra (A-B)       B from A (both resampled on the overlap)
+  Interactive subtraction A-kB drag the slider for k until the difference
+                               flattens; normalizing each to its maximum first
+                               is recommended
+  Range replacement/stitching  replace a wavenumber range of the target
+                               spectrum with the matching range of another
+                               spectrum, with a linear transition at the edges
+  Waterfall                    many spectra stacked with a vertical offset
+  Compare with a reference     compare one spectrum with a single reference
+  Pairing with the local library  compare against every spectrum in 参考谱库
+
+Outputs are CSV plus a PNG preview for each operation.
+
+============================================================
+13. Statistics (clustering and 2D imaging)
+============================================================
+
+Clustering + PCA
+  [Analysis -> Cluster analysis + PCA (selected files)...]
+  Hierarchical clustering with average linkage on 1 - correlation, with PCA for
+  the principal components. Auto cut: the split threshold is chosen
+  automatically (when the spectra are nearly identical you get a single
+  cluster); you can also enter a value yourself.
+  Outputs: a grouping table, a dendrogram PNG and a PCA scatter PNG (with the
+  variance explained).
+
+2D imaging
+  [Analysis -> 2D imaging heat map (selected points)...]
+  The selected point spectra are laid out row-major into a grid; choose the
+  metric: main peak position / intensity / FWHM / number of peaks / total
+  intensity / intensity at a given wavenumber. Outputs: a heat-map PNG and a
+  value table CSV.
+
+============================================================
+14. Batch processing and analysis reports
+============================================================
+
+Batch a folder
+  [File -> Batch a folder...] runs preprocessing + peak tables + plots +
+  conversion over a whole folder, and writes <folder>_批处理汇总.csv with one
+  row per file (number of peaks, main peak position, intensity, FWHM).
+  Useful even for thousands of files.
+
+Analysis report
+  [File -> Export analysis report (selected files)...] writes a single
+  self-contained 光谱分析报告.html: an overview table, the peak table of every
+  spectrum (with assignments when a reference is set), each spectrum chart and
+  the processing parameters. Images are embedded, so the file can be e-mailed
+  as it is, printed to PDF from the browser, or opened in Word / WPS.
+
+============================================================
+15. Advanced settings at a glance
+============================================================
+
+[Settings -> Advanced settings...], five groups:
+
+  Axis range        X min / max, Y min / max (blank = automatic)
+  Spectrum processing  spike removal (window, threshold), baseline (linear /
+                    polynomial order 2 / iterative polynomial / rolling
+                    minimum / rolling ball + window), smoothing (moving average /
+                    Savitzky-Golay + window), derivative, normalization
+  Calibration       Raman shift calibration (one or two measured -> standard
+                    pairs; the second pair is only needed for two-point scaling)
+  Peaks             sensitivity threshold (% of the intensity range, smaller is
+                    more sensitive), minimum separation (cm-1), peak shape for
+                    fitting, assignment reference mineral
+  Figure size       PNG pixels
+
+  "Also apply to exported data" decides whether preprocessing is written into
+  the CSV/Excel, or only used for the chart and peak detection.
+
+============================================================
+16. Command-line quick reference
+============================================================
+
+The GUI is usually enough, but the command line is faster for batches and
+automation. Run  jws2csv.py --help  for a short summary.
+
+Conversion
+  jws2csv.py sample.jws                 convert using the defaults
+  jws2csv.py folder --png --peaks       whole folder, PNG + peak list
+  jws2csv.py --xlsx --out D:\out a.jws  Excel with chart into a folder
+  jws2csv.py --skip-existing            never overwrite existing CSV
+
+Processing (same names as the advanced settings)
+  --despike --baseline iterative --order 5 --iters 20
+  --smooth sg --window 7 --savgol-order 2
+  --deriv 1 --norm max --calib 520.6:520.7
+  --x-min 100 --x-max 2000 --tick 200 --fig-w 1600 --fig-h 900
+  --header-custom "Wavenumber,Intensity"
+
+Analysis
+  --identify FILE --identify-top 12              unknown-spectrum search
+  --identify-must "Zr Si" --identify-not Ca      element filter
+  --identify-kind Raman|IR|XRD|all               restrict the search type
+  --identify-index [PACKAGE_KEY]                 build / update the feature index
+  --identify-all / --identify-no-exact           all entries / index pass only
+  --cluster [FILE|FOLDER] [--cluster-cut 0.2]    clustering + PCA
+  --map 5,5 [--map-metric main_peak|intensity|fwhm|peaks|total|at:1000]
+  --pair FILE                                    auto-pair against the local library
+  --compare FILE --ref FILE                      compare with one reference
+  --average FILES / --subtract A B / --waterfall FILES
+  --report FILES                                 HTML report
+
+Database
+  --rruff-list                            list packages and their state
+  --rruff-get KEY                         download a package (index built automatically)
+  --rruff-search Zircon                   search in the local packages
+  --rruff-fetch Zircon                    bulk fetch by mineral and export
+  --rruff-export Zircon                   export to the local reference library
+  --import-pkg path.zip                   import a package you downloaded
+  --db-search quartz                      search ROD online
+  --db-get IDS                            download spectra from ROD
+  --mineral-search Zircon                 built-in mineral table
+  --mineral-search --by-element "Zr Si"   search by elements
+
+Data and documentation
+  --data-dir [PATH]        show or change the data folder
+  --cache-limit 500        size limit in MB (0 = unlimited)
+  --cleanup 500            free 500 MB by removing packages
+  --manual [PATH]          print the guide, or export it to a file
+  --lang en|zh             interface language
+  --gui                    force the graphical interface
+
+============================================================
+17. Common tasks
+============================================================
+
+I want to do this -> how
+
+Convert a whole batch of .jws to Excel charts
+  -> [File -> Batch a folder...], or jws2csv.py folder --xlsx --png --peaks
+
+Check whether my sample is zircon
+  -> [Database -> RRUFF data sources...] -> search Zircon -> bulk fetch
+  -> [Analysis -> Auto-pair (local database)] -> read the F1 ranking
+
+I have no idea what this spectrum is
+  -> [Analysis -> Unknown-spectrum search (whole-library identification)...]
+  -> [Build / update feature index] -> choose the spectrum -> [Search]
+  -> read the conclusion and the candidate table; fill in "must contain
+     elements" if you have EDS results
+
+The fluorescence background is strong and peaks sit on a slope
+  -> Advanced settings -> Baseline: "iterative polynomial (recommended)",
+     order 5, 20 iterations
+
+There are a few spikes (cosmic rays) on the spectrum
+  -> Advanced settings -> tick "spike removal", window 5, threshold 8-15
+
+Peaks are missing
+  -> lower the peak sensitivity threshold in the advanced settings (for
+     example from 7% to 4%), or click them onto the chart manually
+
+The X axis is slightly off compared with the standard
+  -> use a standard sample (silicon 520.7) and fill in the calibration pair,
+     e.g. 520.6 -> 520.7
+
+I want a figure for publication
+  -> set the figure size (for example 2400x1350), hide the Y values, use a
+     200 cm-1 tick interval, then [Save preview as PNG]
+  -> or export the peak data as JCAMP-DX and redraw it elsewhere
+
+I want to compare many spectra at once
+  -> select them and use the similarity matrix, or the waterfall plot, or
+     clustering + PCA
+
+My peaks are wider after irradiation
+  -> fit them (Gaussian / Lorentzian / pseudo-Voigt), look at the FWHM and the
+     area in the fit table, and compare samples with the similarity matrix
+
+============================================================
+18. Frequently asked questions
+============================================================
+
+Q1 Will data be written to another disk?
+  No. Downloads (reference spectra and RRUFF packages), analysis results and
+  reports all go to 工具数据 inside the tool folder (or to
+  %LOCALAPPDATA%\拉曼光谱工具\工具数据 when the tool folder is read-only). The
+  only exception is the conversion output, which by default goes next to your
+  source file because that is usually what you want; change [2. Output location]
+  if you prefer somewhere else.
+
+Q2 Why does my CSV show only numbers in WPS?
+  A CSV cannot contain a chart. Choose "Excel (with chart)" or PNG instead.
+
+Q3 The chart is blank / all zeros
+  Check whether the file really contains spectral data (open it as text: two
+  columns of numbers), whether the X column is numeric, and whether the axis
+  range in the advanced settings excludes your data.
+
+Q4 Excel export failed with a message about openpyxl
+  Install it:  pip install openpyxl  (PNG export needs  pip install pillow).
+
+Q5 RRUFF download fails
+  Check the network and the proxy; the tool prints the reason in the log. If a
+  package is too large you can download a smaller one first (12 MB). You can
+  also download a zip yourself and use [Database -> ... -> Import a local zip...].
+
+Q6 Why does the pairing report show a low F1 even for the right mineral?
+  F1 is strict: peaks that the reference has but your spectrum does not lower
+  the score. Check the peak comparison table and the correlation coefficient as
+  well, and try a fair / excellent package (better spectra). Slight systematic
+  axis differences also matter - use the calibration.
+
+Q7 Why is the peak position slightly different from the literature?
+  Instrument calibration and the laser wavelength shift peaks by a few cm-1.
+  Use the calibration pair to align with a standard, and always compare within
+  the same laser wavelength.
+
+Q8 Can several .jws channels be handled?
+  Yes; each channel is exported and plotted separately and the peak table has a
+  "channel" column.
+
+Q9 Can I use my own reference spectra?
+  Yes. The reference library is a plain CSV folder (first column X, second
+  column intensity). Drop files into 工具数据/参考谱库, or export spectra from
+  the database; they can then be used for pairing, comparison and combination.
+
+Q10 Can charts be exported as vector graphics?
+  Currently PNG (1600x900 by default, adjustable). For vector output use the
+  Excel chart or redraw the JCAMP-DX data in another program.
+
+Q11 The unknown-spectrum search says "not found" - is the tool wrong?
+  Check three things: (1) is the feature index built; (2) is the search type
+  correct (do not compare a Raman spectrum with IR/XRD packages); (3) does the
+  library contain the mineral at all - if it does not, nothing can find it. The
+  unrated package has only about 600 spectra; download a fair / excellent
+  package and try again. If your peaks are systematically shifted, calibrate the
+  spectrum first (see chapter 7).
+
+Q12 What is the difference between "possible" and "reliable" candidate?
+  "Reliable" requires all three: score >= 60, at least 2 of the 3 strongest
+  peaks matched, and a clear lead (>= 15 points) over the runner-up. If any of
+  them fails you only get "possible", and when the top scores are close the tool
+  says explicitly that the mineral may not be in the library. In either case the
+  final check is the peak comparison table from the pairing report.
+
+Q13 Can the interface be in English?
+  Yes: [Settings -> Language], or --lang en on the command line. The
+  full manual and this guide exist in both languages; folder names on disk stay
+  in Chinese so that data remains portable.
+
+============================================================
+19. Relation to the RRUFF tools
+============================================================
+
+The tools listed on the RRUFF "Tools" page, and how this tool covers them:
+
+  Crystal Sleuth      reading and plotting spectra, peak tables, JCAMP-DX
+                      import/export            -> covered (chapters 3, 4)
+  RamanLab            baseline correction, smoothing, derivatives, peak
+                      fitting, peak assignment to minerals, batch processing
+                      -> covered (chapters 7, 8, 9, 14)
+  RamanCrystalHunter  comparing spectra with a reference library, peak-match
+                      scoring and candidate ranking -> covered, with F1 scoring
+                      and whole-library unknown-spectrum identification
+                      (chapter 11)
+  XtalDraw / USPEX    three-dimensional crystal structure drawing and structure
+                      prediction -> NOT covered: they are crystallography and
+                      first-principles modelling tools, a different line of work
+                      from Raman data processing
+
+Features added beyond those tools
+  - RRUFF packages (Raman / IR / XRD / chemistry) with local search, bulk fetch
+    and an offline reference library
+  - unknown-spectrum identification with confidence levels and an element filter
+  - 2D imaging heat maps and clustering + PCA
+  - self-contained HTML reports and folder batch processing
+
+Extending the tool
+  - The mineral assignment table is _MINERAL_DB in jws2csv.py; add one record
+    (English and Chinese names, formula, crystal system, characteristic peaks
+    and assignments) to extend it.
+  - The reference library is plain CSV (first column X, second column
+    intensity); standards from any source can take part in comparison and
+    pairing.
+
+============================================================
+End of the guide. Good luck with your experiments!
+============================================================
