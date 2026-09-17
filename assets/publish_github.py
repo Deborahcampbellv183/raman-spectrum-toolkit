@@ -194,9 +194,13 @@ def main():
              {"sha": commit["sha"], "force": True})
     print("· 已提交 %d 个文件，commit %s" % (len(blobs), commit["sha"][:8]))
 
-    # 4) topics
-    call("PUT", "%s/repos/%s/%s/topics" % (API, OWNER, REPO), {"names": TOPICS})
-    print("· topics 已设置：%d 个" % len(TOPICS))
+    # 4) topics（细粒度令牌可能没有该权限；不是必需步骤，403 只提示不中断）
+    st, _t = call("PUT", "%s/repos/%s/%s/topics" % (API, OWNER, REPO),
+                  {"names": TOPICS}, ok=(200, 201, 403))
+    if st == 403:
+        print("· 令牌无 topics 权限，跳过（仓库原有话题保持不变）")
+    else:
+        print("· topics 已设置：%d 个" % len(TOPICS))
 
     # 5) Release（已存在则沿用）
     st, rel = call("GET", "%s/repos/%s/%s/releases/tags/%s" % (API, OWNER, REPO, tag),
