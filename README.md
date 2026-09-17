@@ -29,7 +29,7 @@
 | **格式转换** | `.jws`/CSV/SPC/JCAMP-DX/TXT → CSV、**带图的 Excel**、PNG 曲线图、峰列表、JCAMP-DX |
 | **峰分析** | 自动找峰并标注峰位（**峰位带波长虚线**）、**标错的峰连同自动峰一起右键删除、可一键恢复**、手动补标、高斯/洛伦兹/伪 Voigt 峰拟合、峰位检索；峰位数值可一键隐藏 |
 | **未知谱鉴定** | 不知道样品是什么？拿它的峰去整个参考库比对，按可信度给出候选矿物 + 峰位对照；**批量鉴定**可一次把一个文件夹的谱逐条给出最佳候选 |
-| **参考谱库** | 在线检索 ROD、按矿物批量抓取 RRUFF 数据包（拉曼 / 红外 / XRD / 化学成分），导出为本地库 |
+| **参考谱库** | 在线检索 ROD、按矿物批量抓取 RRUFF 数据包（拉曼 / 红外 / XRD / 化学成分），导出为本地库；**下载支持断点续传 + 32 路并发 + 动态领活 + 自动重试，可填代理，后台进行、随时可取消，大包按实测速率标出预计耗时** |
 | **配对比较** | 实测谱 ↔ 标准谱手动/自动配对，输出峰位匹配 F1、相关系数、谱角与对照报告图；**批量配对**可拿一组标准谱一次筛一个文件夹，**对不上的排在最前面**（综合分、F1、相关系数等全列出来，判读只是提示，结论自己下） |
 | **预处理** | 尖峰（宇宙射线）去除、基线校正、平滑、导数、归一化、拉曼位移校准 |
 | **统计分析** | 层次聚类 + PCA、二维成像热图、平均/相减、谱段替换、交互式 A−k·B 找平 |
@@ -123,6 +123,52 @@ python jws2csv.py --manual                   # 打印完整说明书
 * 注意：只识别到 **1 个峰**的谱，F1 一律记 0（命中 < 2 不算识别），
   综合分因此封顶 50、一直停在「部分匹配」档。这是故意的——单个峰定不了案。
 
+## 下载数据库为什么慢，以及现在怎么处理
+
+RRUFF 官网在国外，**主要瓶颈是这条跨境链路**（实测 ping 丢包 25%、RTT 236 ms），
+不是工具的问题。在你的网络下实测：
+
+| 同时开的连接数 | 实测吞吐 | 227 MB 的包要等 |
+|---|---|---|
+| 1 路 | ~0.03 MB/s | 约 2 小时 |
+| 8 路 | ~0.32 MB/s | 约 12 分钟 |
+| **32 路（默认）** | **~0.89 MB/s** | **约 4 分钟** |
+| 64 路 | ~1.28 MB/s | 约 3 分钟 |
+| 96 路 | ~1.45 MB/s | 约 2.6 分钟 |
+
+**吞吐几乎正比于同时在跑的连接数**（服务器全程没有拒绝），所以并发数是最好用的那个旋钮。
+默认给 32 路，可在【下载】对话框的“并发连接数”里调（1~128），
+命令行 `--dl-conns 96` 也行。
+（上表取自同一次测量；这条链路随时段波动很大，绝对值能差 2~3 倍，
+但“连接数越多越快”这个趋势是稳定的。另外为了不把开销都花在握手上，
+每个连接至少要分到 256 KB 的活，所以很小的包不会硬开几十路。）
+
+既然带宽改不了，就把**能拿到的全拿到**：
+
+* **后台下载**：进度条 + 已下/总数 + 实时速率 + 剩余时间。以前下载期间窗口是**假死**的
+  （旧代码在循环里只调 `update_idletasks()`，不处理鼠标和关闭事件），
+  十几分钟点不动、关不掉，只能强杀进程——这就是你说的"崩溃"。
+* **断点续传**：服务器支持 `Accept-Ranges`，取消 / 掉线 / 强杀**都不会白费**，
+  下次接着下。以前一断就从 0 重来。
+* **动态领活（work-stealing）**：不是"把文件平均分给 N 条连接"，
+  而是切成小段放进队列、**谁下完谁再领一段**。
+  实测同一个 33 MB 的包，32 等分里**最快那段 4.3 s、最慢那段 79 s**——
+  静态均分等于花 79 s 等一条卡住的连接（95% 的时间在干等）。
+  真实链路同一时段交错 A/B（12 MB 的包、都是 32 路）：
+  **静态均分平均 39.1 s → 动态领活平均 23.2 s，快 1.69 倍**。
+* **代理**：丢包严重的链路上，走代理 / VPN 往往比堆并发更快。
+  在【下载】对话框填代理地址（留空则沿用 Windows 系统代理），或命令行 `--proxy`。
+* **自动重试**：断线按 1.5×n 秒退避重试，并从断点继续；服务器返回 429/503
+  会识别出来并提示"把并发调小些"。
+* **完整性校验**：长度对不上**不算下载成功**。以前 `Content-Length` 只用来显示进度，
+  截断的 zip 会被当成"下载成功"并标记"已下载"，直到建索引时才报错——
+  看着就像又崩了一次。
+* **预计耗时**：数据包列表里按**你上次实测到的速率**估算（越用越准），
+  下 ≥50 MB 的大包前会弹窗告知要等多久。
+
+如果实在慢，先下 `fair_oriented`（271 KB）练手，或者用浏览器在能直连的网络上下好 zip，
+再用【导入本地 zip…】。
+
 ## 中文 / 英文
 
 界面、日志、命令行输出、分析报告、图注与说明书都可切换：
@@ -166,7 +212,7 @@ The GUI, CLI, reports and manuals are **fully bilingual (Chinese / English)**.
 | **Conversion** | `.jws` / CSV / SPC / JCAMP-DX / TXT → CSV, **Excel with embedded chart**, PNG plot, peak table, JCAMP-DX |
 | **Peak analysis** | automatic peak detection with position labels (**each peak gets a dashed line down to the x axis**), **right-click to delete a wrong peak — automatic ones included — and restore them all with one click**, manual annotation, Gaussian / Lorentzian / pseudo-Voigt fitting, peak-position search; peak values can be hidden |
 | **Unknown spectra** | identify a spectrum whose mineral you do not know by matching its peaks against a whole reference library, with confidence ranking and a peak-by-peak comparison; **batch identification** runs a whole folder and gives the best candidate per spectrum |
-| **Reference libraries** | search ROD online, bulk-fetch RRUFF packages (Raman / IR / XRD / chemistry), export them into a local library |
+| **Reference libraries** | search ROD online, bulk-fetch RRUFF packages (Raman / IR / XRD / chemistry), export them into a local library; **downloads resume after a drop, use 4 parallel connections with automatic retries, run in the background with a working Cancel button, and show an estimated time based on your own measured speed** |
 | **Pairing** | measured ↔ reference pairing (manual or automatic) with peak-match F1, correlation, spectral angle, and a comparison report figure; **batch pairing** screens a whole folder against a reference set and **puts the mismatches first** (score, F1, correlation and more — the reading is advisory, you decide) |
 | **Preprocessing** | spike (cosmic ray) removal, baseline correction, smoothing, derivative, normalization, Raman shift calibration |
 | **Statistics** | hierarchical clustering + PCA, 2D imaging heat map, average / subtract, range replacement, interactive A−k·B flattening |
@@ -234,6 +280,56 @@ around them and take a whole folder, producing a one-row-per-spectrum table:
 * Note: a spectrum with only **one** detected peak always gets F1 = 0 (fewer than 2 matches does
   not count), so its score caps at 50 and it stays in the "partial match" band. That is deliberate —
   one peak cannot settle anything.
+
+### Why package downloads are slow, and what was done about it
+
+rruff.net is hosted outside China, so **the bottleneck is this cross-border link** (measured: 25%
+packet loss, 236 ms RTT) rather than a bug in the tool. Measured on this network:
+
+| Simultaneous connections | Measured throughput | Time for the 227 MB package |
+|---|---|---|
+| 1 | ~0.03 MB/s | ~2 hours |
+| 8 | ~0.32 MB/s | ~12 minutes |
+| **32 (default)** | **~0.89 MB/s** | **~4 minutes** |
+| 64 | ~1.28 MB/s | ~3 minutes |
+| 96 | ~1.45 MB/s | ~2.6 minutes |
+
+**Throughput is roughly proportional to the number of simultaneous connections** (the server never
+refused), so concurrency is the lever that matters. The default is 32; change it in the download
+dialog's "connections" field (1–128) or with `--dl-conns 96` on the command line.
+(The table is from a single measurement session; this link varies a lot by time of day, with
+absolute numbers swinging 2–3x, but the "more connections is faster" trend is stable. Each
+connection is also guaranteed at least 256 KB of work so that small packages do not spend
+everything on handshakes.)
+
+Bandwidth cannot be fixed, so everything obtainable from the code side is now taken:
+
+* **Background download** with a progress bar, downloaded/total, live speed and time left.
+  The window used to be **frozen** during a download (the old loop only called
+  `update_idletasks()`, which does not process mouse or close events), so for ten-odd minutes it
+  could not be clicked or closed and the only option was to kill the process — that is the "crash".
+* **Resume**: the server supports `Accept-Ranges`, so a cancel, a dropped connection or a
+  force-kill **no longer wastes anything**; the next run continues where it stopped. Previously it
+  restarted from zero.
+* **Work-stealing scheduling**: instead of splitting the file into N equal shards (one per
+  connection), the file is cut into work units in a queue and **a connection that finishes grabs the
+  next unit**. Measured on the same 33 MB package, the fastest of 32 equal shards needed 4.3 s while
+  the slowest needed 79 s — equal shards mean 79 s of waiting for one stalled connection (95% of the
+  wall clock spent idle). Interleaved A/B on the real link (12 MB package, 32 connections both
+  ways): **39.1 s average for equal shards vs 23.2 s with work stealing — 1.69x faster**.
+* **Proxy**: on a lossy link a proxy or VPN is often faster than piling on connections. Enter one in
+  the download dialog (leave blank to reuse the Windows system proxy) or use `--proxy`.
+* **Automatic retries** with 1.5 x n second backoff, resuming inside the part; a 429/503 from the
+  server is detected and reported with a "lower the concurrency" hint.
+* **Integrity check**: a byte-count mismatch is **not** treated as success. Previously
+  `Content-Length` was only used for the progress display, so a truncated zip was recorded as a
+  successful download and marked "downloaded" — the failure surfaced only later when the index was
+  built, which looked like another crash.
+* **Estimated time** in the package list, based on **your own last measured speed** (it improves over
+  time); packages of 50 MB or more ask for confirmation first.
+
+If it really is too slow, start with `fair_oriented` (271 KB), or download the zip with a browser on
+a well-connected network and use "Import local zip...".
 
 ### Credits
 

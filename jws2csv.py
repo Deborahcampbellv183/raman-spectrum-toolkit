@@ -97,12 +97,15 @@ import colorsys
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -3793,16 +3796,35 @@ def build_report(paths, out_path=None, title=None, plot=None, verbose=False):
     return out_path, len(spectra)
 
 
-def _http_get(url, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "SpectraTool/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-    for enc in ("utf-8", "latin-1"):
+def _http_get(url, timeout=30, retries=3, max_bytes=32 * 1048576):
+    """取一个文本响应（ROD 检索 / JDX 谱线）。
+
+    带重试（网络抖动很常见）与体积上限（原来是无上限整体读进内存）。
+    """
+    last = None
+    tries = max(1, int(retries))
+    opener = make_opener()
+    for attempt in range(1, tries + 1):
         try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", "ignore")
+            req = urllib.request.Request(url, headers={"User-Agent": "SpectraTool/1.0"})
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise JwsError(T("响应过大（超过 %d MB），已放弃")
+                               % (max_bytes // 1048576))
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    return raw.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", "ignore")
+        except JwsError:
+            raise
+        except Exception as exc:
+            last = exc
+            if attempt < tries:
+                time.sleep(1.5 * attempt)
+    raise JwsError(T("网络请求失败（重试 %d 次）：%s") % (tries, last))
 
 
 def _num(text):
@@ -3894,6 +3916,11 @@ def rod_fetch(rod_id, timeout=40):
     xs, ys, meta = parse_jcamp(_http_get(url, timeout))
     if len(xs) < 4:
         raise JwsError(T("未取得有效光谱数据：%s") % rod_id)
+    # 传输被截断时 JDX 的 NPOINTS 会对不上；只判“收少了”，宁可报错也别把半截谱存进库
+    expect = _num(meta.get("NPOINTS"))
+    if expect and len(xs) < int(expect) - max(2, int(expect) * 0.02):
+        raise JwsError(T("光谱数据不完整：应为 %d 点，实际收到 %d 点（可稍后重试）")
+                       % (int(expect), len(xs)))
     return xs, ys, meta
 
 
@@ -3910,10 +3937,20 @@ def db_save_spectrum(rod_id, mineral, xs, ys, meta=None, xlabel=None, tag=None):
         folder = os.path.join(folder, str(tag))
         os.makedirs(folder, exist_ok=True)
     dst = os.path.join(folder, "%s%s_%s%s.csv" % (prefix, label, rod_id, suffix))
-    with open(dst, "w", encoding="utf-8-sig", newline="") as f:
-        f.write("%s,Intensity\n" % (xlabel or "Raman shift (cm-1)"))
-        for x, y in zip(xs, ys):
-            f.write("%.4f,%.6g\n" % (x, y))
+    tmp = dst + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("%s,Intensity\n" % (xlabel or "Raman shift (cm-1)"))
+            for x, y in zip(xs, ys):
+                f.write("%.4f,%.6g\n" % (x, y))
+        # 写完才转正：否则写盘中途出错会留下半截 CSV，还会被 db_list 当成正常谱进库
+        os.replace(tmp, dst)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return dst
 
 
@@ -4023,10 +4060,553 @@ def package_bytes(pkg):
         req = urllib.request.Request(_package_url(pkg),
                                      headers={"User-Agent": "SpectraTool/1.0"})
         req.get_method = lambda: "HEAD"
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with make_opener().open(req, timeout=20) as resp:
             return float(resp.headers.get("Content-Length") or 0)
     except Exception:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 下载引擎：断点续传 + 并发分片 + 自动重试 + 完整性校验
+#
+# 为什么并发要开这么大（实网实测，2026-09）：
+#   到 rruff.net（OVH 加拿大）ping 丢包 25%、RTT 236 ms。这种“长肥丢包链路”下
+#   单个 TCP 连接会被拥塞控制压死，实测 1 路只有 0.027 MB/s；并发数几乎就是吞吐量：
+#       1 路 0.027 / 8 路 0.32 / 16 路 0.41 / 32 路 0.89 / 64 路 1.28 / 96 路 1.45 MB/s
+#   227 MB 的包：1 路要 140 分钟，32 路约 4 分钟，64 路约 3 分钟（服务器全程无拒绝）。
+#   所以默认给 32 路，可用 --dl-conns / 高级设置里调（1~128）。
+# 另一条更快的路：如果你有代理 / VPN，把地址填进设置（或打开系统代理），
+#   走代理能绕开这条高丢包链路，往往比堆并发快得多。
+# ---------------------------------------------------------------------------
+
+DOWNLOAD_CHUNK = 1 << 16
+DOWNLOAD_CONNECTIONS = 32
+DOWNLOAD_CONNECTIONS_MAX = 128
+DOWNLOAD_RETRIES = 5
+DOWNLOAD_TIMEOUT = 60
+# 工作单元（work unit）大小：文件切成一个个小段放进队列，
+# 谁先下完谁再领下一段，免得总耗时被最慢的那一条连接拖住。
+# 单元数必须 ≫ 连接数（否则没得可领），但也不能太碎（每个单元要新开一条连接，
+# 跨境链路上一次握手约 0.5 s）。实测吞吐几乎正比于同时在跑的连接数，
+# 所以「连接数」这一项不能因为文件小就被砍掉。
+DOWNLOAD_WORK_UNIT = 2 << 20              # 单个工作单元上限
+DOWNLOAD_MIN_UNIT = 64 * 1024             # 单个工作单元下限
+DOWNLOAD_UNITS_PER_LANE = 4               # 每条连接分几个单元，留出领活余地
+DOWNLOAD_MIN_LANE_BYTES = 256 * 1024      # 每条连接至少分到这么多活，否则少开几路
+DOWNLOAD_MAX_UNITS = 512
+_UA = {"User-Agent": "SpectraTool/1.0"}
+# 默认下行速率（字节/秒），仅用于“预计耗时”提示；每次真实下载完会写回实测值。
+DEFAULT_DOWNLOAD_BPS = 1.0 * 1048576.0
+
+
+class DownloadCancelled(Exception):
+    """用户在下载过程中点了取消。"""
+
+
+def download_connections():
+    """并发连接数：设置里可调，默认 DOWNLOAD_CONNECTIONS。"""
+    try:
+        value = int(float(_load_settings().get("download_conns") or 0))
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return DOWNLOAD_CONNECTIONS
+    return max(1, min(value, DOWNLOAD_CONNECTIONS_MAX))
+
+
+def download_lanes(connections, total):
+    """真正开几条连接。
+
+    实测吞吐几乎正比于同时在跑的连接数（32 路 0.89、64 路 1.28、96 路 1.45 MB/s），
+    所以只要文件装得下就一路给到 connections；文件太小才收敛，
+    否则 271 KB 的包也会去开 32 条连接，全耗在握手上。
+    """
+    if total <= 0:
+        return max(1, int(connections))
+    fit = max(1, int(total // DOWNLOAD_MIN_LANE_BYTES))
+    return max(1, min(int(connections), fit))
+
+
+def download_units(total, lanes):
+    """切成多少个工作单元。
+
+    目标：每条连接分到 DOWNLOAD_UNITS_PER_LANE 个单元，这样才有“谁先下完谁再领”
+    的余地；单元大小被夹在 [DOWNLOAD_MIN_UNIT, DOWNLOAD_WORK_UNIT] 之间。
+    """
+    if total <= 0:
+        return 1
+    want = max(1, int(lanes) * DOWNLOAD_UNITS_PER_LANE)
+    if total // want < DOWNLOAD_MIN_UNIT:
+        want = max(1, int(total // DOWNLOAD_MIN_UNIT))
+    unit = min(DOWNLOAD_WORK_UNIT,
+               max(DOWNLOAD_MIN_UNIT, total // max(1, want)))
+    return max(1, min(int(math.ceil(total / float(unit))), DOWNLOAD_MAX_UNITS))
+
+
+def download_spans(total, units):
+    """工作单元 → (起始字节, 结束字节) 列表；total 未知时返回单段读到 EOF。"""
+    if total <= 0:
+        return [(0, None)]
+    return [(total * i // units, total * (i + 1) // units - 1)
+            for i in range(units)]
+
+
+def system_proxy():
+    """读 Windows 系统代理（“设置 → 网络 → 代理”）。没开或读不到就返回 ""。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    except OSError:
+        return ""
+    try:
+        try:
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        except OSError:
+            return ""
+    finally:
+        try:
+            winreg.CloseKey(key)
+        except OSError:
+            pass
+    if not enable:
+        return ""
+    server = str(server or "").strip()
+    if "=" in server:                 # 形如 http=host:port;https=host:port
+        parts = dict(p.split("=", 1) for p in server.split(";") if "=" in p)
+        server = (parts.get("https") or parts.get("http") or "").strip()
+    if not server:
+        return ""
+    return server if "://" in server else "http://" + server
+
+
+def proxy_url():
+    """实际用的代理：设置里填了用它，否则用系统代理；都没有返回 ""（直连）。
+
+    设置里填 none / off / direct 可以强制直连（忽略系统代理）。
+    """
+    explicit = str(_load_settings().get("proxy") or "").strip()
+    if explicit:
+        if explicit.lower() in ("none", "off", "direct", "0", "关闭", "直连"):
+            return ""
+        return explicit if "://" in explicit else "http://" + explicit
+    return system_proxy()
+
+
+def make_opener():
+    """按当前代理设置生成 opener；直连时显式绕开环境变量里的代理。
+
+    高丢包链路上并发是唯一能提吞吐的手段，所以这里一次生成、多个线程复用。
+    """
+    proxy = proxy_url()
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    else:
+        handler = urllib.request.ProxyHandler({})
+    return urllib.request.build_opener(handler)
+
+
+def download_speed_bps():
+    """上次实测到的下行速率（字节/秒），没有记录时用默认值。"""
+    try:
+        value = float(_load_settings().get("download_bps") or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return value if value > 1024 else DEFAULT_DOWNLOAD_BPS
+
+
+def remember_download_speed(bps):
+    """把本次实测速率记进设置，让下次的“预计耗时”更准。"""
+    if not bps or bps <= 1024:
+        return
+    data = _load_settings()
+    try:
+        old = float(data.get("download_bps") or 0)
+    except (TypeError, ValueError):
+        old = 0.0
+    if old and abs(bps - old) / max(old, 1.0) < 0.25:
+        return                      # 变化不大就别反复写盘
+    data["download_bps"] = "%d" % int(bps)
+    _save_settings(data)
+
+
+def estimate_download_seconds(size_bytes, bps=None):
+    """按实测速率估算下载耗时（秒）；大小未知时返回 None。"""
+    if not size_bytes:
+        return None
+    rate = bps or download_speed_bps()
+    if rate <= 0:
+        return None
+    return float(size_bytes) / rate
+
+
+def format_eta(seconds):
+    """把秒数写成“不到 1 分钟 / 约 6 分钟 / 约 1 小时 5 分钟”。"""
+    if seconds is None:
+        return ""
+    sec = int(max(0, round(seconds)))
+    if sec < 60:
+        return T("不到 1 分钟")
+    minutes = sec / 60.0
+    if minutes < 60:
+        return T("约 %.0f 分钟") % max(1.0, round(minutes))
+    hours = int(minutes // 60)
+    rest = int(round(minutes - hours * 60))
+    if rest <= 0:
+        return T("约 %d 小时") % hours
+    return T("约 %d 小时 %d 分钟") % (hours, rest)
+
+
+def format_mb(nbytes):
+    return "%.1f MB" % (float(nbytes) / 1048576.0)
+
+
+class DownloadMeter:
+    """把“已收 / 总数”换算成瞬时速率与剩余时间，供界面显示。"""
+
+    def __init__(self, window=8.0):
+        self.window = float(window)
+        self.samples = []
+        self.t0 = None
+
+    def update(self, got, total=0):
+        """返回 (速率 字节/秒, 剩余秒数或 None)。"""
+        now = time.time()
+        if self.t0 is None:
+            self.t0 = now
+        self.samples.append((now, got))
+        cutoff = now - self.window
+        while len(self.samples) > 2 and self.samples[0][0] < cutoff:
+            self.samples.pop(0)
+        t_a, n_a = self.samples[0]
+        span = now - t_a
+        speed = (got - n_a) / span if span > 0.35 else 0.0
+        eta = ((total - got) / speed) if (total and speed > 0 and got < total) else None
+        return speed, eta
+
+    def average(self, got):
+        if self.t0 is None or got <= 0:
+            return 0.0
+        return got / max(0.001, time.time() - self.t0)
+
+
+def _probe_download(url, timeout=30, opener=None):
+    """探测远端大小与是否支持 Range，返回 (总字节, 是否支持断点续传)。"""
+    total = 0
+    ranged = False
+    op = opener or make_opener()
+    try:
+        req = urllib.request.Request(url, headers=dict(_UA))
+        req.get_method = lambda: "HEAD"
+        with op.open(req, timeout=timeout) as r:
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            ranged = str(r.headers.get("Accept-Ranges") or "").lower() == "bytes"
+    except Exception:
+        return 0, False
+    if not total:
+        return 0, False
+    if ranged:
+        return total, True
+    # 有的服务器不报 Accept-Ranges 但其实支持，试一次 bytes=0-0
+    try:
+        req = urllib.request.Request(url, headers=dict(_UA, **{"Range": "bytes=0-0"}))
+        with op.open(req, timeout=timeout) as r:
+            if r.status != 206:
+                return total, False
+            content_range = str(r.headers.get("Content-Range") or "")
+            r.read(1)
+        if "/" in content_range:
+            try:
+                total = int(content_range.rsplit("/", 1)[1])
+            except ValueError:
+                pass
+        return total, True
+    except Exception:
+        return total, False
+
+
+def download_file(url, dst, progress=None, cancel=None,
+                  connections=None, timeout=60, retries=DOWNLOAD_RETRIES):
+    """下载 url 到 dst：断点续传 + 并发分片 + 自动重试 + 完整性校验。
+
+    · 续传：分片写到 dst.part0 / .part1 …，下次接着下；中途取消或断网都不白费。
+    · 并发：默认 download_connections()（32 路）。高丢包跨境链路下并发数几乎就是吞吐量，
+      实测 1 路 0.027 MB/s、32 路 0.89 MB/s、96 路 1.45 MB/s；文件太小（<256 KB/路）才少开。
+      分片按固定大小的“工作单元”（download_units）切，谁下完谁再领下一段，
+      不是把文件平均分成 N 份 —— 后者总耗时等于最慢的那一份。
+      单元数记在 .part.meta 里，中途改并发数也能接着续传。
+    · 代理：按 proxy_url() 走（设置里的代理 > Windows 系统代理 > 直连）。
+    · 重试：分片内失败按 1.5×n 秒退避重试，且从该分片已收到的位置继续。
+    · 校验：探到 Content-Length 就必须收满，收不满不转正、抛错并保留分片。
+    · 原子：全部收满才拼成 dst.part.join 再 os.replace 到 dst。
+    progress(got, total, speed, eta) 可能被多个线程调用（界面侧只存值、由主线程渲染）；
+    cancel 传 threading.Event，置位后抛 DownloadCancelled。
+    """
+    dst = os.path.abspath(dst)
+    parent = os.path.dirname(dst)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if connections is None:
+        connections = download_connections()
+
+    def cancelled():
+        return cancel is not None and cancel.is_set()
+
+    if cancelled():
+        raise DownloadCancelled()
+
+    opener = make_opener()
+    total, ranged = _probe_download(url, timeout=timeout, opener=opener)
+
+    # 旧版留下的是单个 .part（从 0 开始的连续前缀），迁移成第 0 个分片，别浪费
+    legacy = dst + ".part"
+    if os.path.exists(legacy) and not os.path.exists(dst + ".part0"):
+        try:
+            os.replace(legacy, dst + ".part0")
+        except OSError:
+            pass
+
+    def part_path(i):
+        return "%s.part%d" % (dst, i)
+
+    # 切法（单元数）记在 .part.meta 里：并发数改了、文件大小没变时沿用上次的切法，
+    # 已有的 .partN 才对得上号，断点续传才有意义。
+    meta_path = dst + ".part.meta"
+    old_units = 0
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                old = f.read().splitlines()
+        except OSError:
+            old = []
+        # 元信息里记着 url / 总长 / 单元数；三者对得上才认旧分片
+        if bool(old) and len(old) > 2 and old[0] == url and old[1] == str(total):
+            try:
+                old_units = int(old[2])
+            except ValueError:
+                old_units = 0
+        if old_units <= 0:
+            # 远端文件换了（大小变了）或元信息不全 → 丢弃旧分片，免得拼出个坏文件
+            for i in range(0, DOWNLOAD_MAX_UNITS + 1):
+                try:
+                    os.remove(part_path(i))
+                except OSError:
+                    pass
+
+    if total > 0 and ranged and old_units > 0:
+        # 续传：无条件沿用上次的切法（哪怕这次并发数不一样），否则分片编号会错位、
+        # 拼出来的文件长度就不对了。并发数只影响同时开几条连接。
+        units = min(old_units, DOWNLOAD_MAX_UNITS)
+        lanes = max(1, min(int(connections), units))
+    elif ranged and total > 0 and connections > 1:
+        lanes = download_lanes(connections, total)
+        units = download_units(total, lanes)
+        lanes = max(1, min(lanes, units))
+    else:
+        lanes, units = 1, 1
+
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write("%s\n%d\n%d\n" % (url, total, units))
+    except OSError:
+        pass
+
+    spans = download_spans(total, units)
+
+    counts = [0] * units
+    for i, (start, end) in enumerate(spans):
+        path = part_path(i)
+        if not os.path.exists(path):
+            continue
+        have = os.path.getsize(path)
+        limit = None if end is None else (end - start + 1)
+        if limit is not None and have > limit:    # 分片比应有长度还长：截断重来
+            try:
+                os.truncate(path, limit)
+            except OSError:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            have = limit
+        counts[i] = have                          # 已收到的计入总进度
+
+    lock = threading.Lock()
+    meter = DownloadMeter()
+    failures = []
+    throttled = []          # 被服务器限流（429/503）的次数，用来给出“调低并发”的提示
+
+    def report():
+        got = sum(counts)
+        speed, eta = meter.update(got, total)
+        if progress:
+            progress(got, total, speed, eta)
+
+    def fetch(i, start, end):
+        path = part_path(i)
+        attempt = 0
+        while True:
+            if cancelled():
+                raise DownloadCancelled()
+            have = os.path.getsize(path) if os.path.exists(path) else 0
+            limit = None if end is None else (end - start + 1)
+            if limit is not None and have >= limit:
+                return                            # 这一片已经齐了
+            if have and not ranged:
+                # 服务器不支持续传，只能从 0 重来
+                try:
+                    os.truncate(path, 0)
+                except OSError:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                with lock:
+                    counts[i] = 0
+                have = 0
+            headers = dict(_UA)
+            need_range = (units > 1) or (start + have) > 0
+            if need_range:
+                headers["Range"] = "bytes=%d-%s" % (
+                    start + have, "" if end is None else str(end))
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=timeout) as r:
+                    if need_range and r.status != 206:
+                        raise JwsError(T("服务器不支持断点续传（HTTP %s）") % r.status)
+                    with open(path, "ab") as f:
+                        while True:
+                            if cancelled():
+                                raise DownloadCancelled()
+                            chunk = r.read(DOWNLOAD_CHUNK)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            with lock:
+                                counts[i] += len(chunk)
+                                report()
+                # 服务端可能提前断流：长度没到就不能当成下完了
+                if limit is not None:
+                    now_have = os.path.getsize(path) if os.path.exists(path) else 0
+                    if now_have < limit:
+                        raise JwsError(T("连接提前中断（本段还差 %d 字节）")
+                                       % (limit - now_have))
+                return
+            except DownloadCancelled:
+                raise
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 503):
+                    with lock:
+                        throttled.append(exc.code)
+                attempt += 1
+                if cancelled():
+                    raise DownloadCancelled()
+                if attempt >= retries:
+                    with lock:
+                        failures.append((i, exc))
+                    return
+                time.sleep(min(8.0, 1.5 * attempt))
+            except Exception as exc:
+                attempt += 1
+                if cancelled():
+                    raise DownloadCancelled()
+                if attempt >= retries:
+                    with lock:
+                        failures.append((i, exc))
+                    return
+                time.sleep(min(8.0, 1.5 * attempt))
+
+    def lane():
+        """一条连接：下完手上的工作单元就回队列再领一个。
+
+        静态均分（每连接固定一段）时总耗时等于最慢那一段，实测 33 MB 的包
+        最快段 4.3 s、最慢段 79 s，快连接干完只能干等；改成领活之后，
+        快连接会把后面的段一起吃掉，慢尾被摊平。
+        取消异常在这里就地吞掉（join 之后主流程统一判断），
+        否则线程里抛出会打到 stderr，看着像崩溃。
+        """
+        while True:
+            if cancelled():
+                return
+            try:
+                i = job_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fetch(i, spans[i][0], spans[i][1])
+            except DownloadCancelled:
+                return
+
+    job_queue = queue.Queue()
+    for i in range(units):
+        job_queue.put(i)
+
+    if lanes <= 1 and units == 1:
+        fetch(0, spans[0][0], spans[0][1])
+    else:
+        threads = [threading.Thread(target=lane, daemon=True)
+                   for _ in range(lanes)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    if cancelled():
+        raise DownloadCancelled()
+    if failures:
+        hint = ""
+        if throttled:
+            hint = (T("　服务器多次限流（HTTP %s），请把并发连接数调小些再试。")
+                    % throttled[0])
+        raise JwsError(T("下载失败（重试 %d 次仍未完成）：%s")
+                       % (retries, failures[0][1]) + hint)
+
+    def cleanup():
+        for i in range(units):
+            try:
+                os.remove(part_path(i))
+            except OSError:
+                pass
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
+
+    joined = dst + ".part.join"
+    try:
+        with open(joined, "wb") as out:
+            for i in range(units):
+                path = part_path(i)
+                if not os.path.exists(path):
+                    continue
+                with open(path, "rb") as f:
+                    shutil.copyfileobj(f, out, DOWNLOAD_CHUNK)
+    except OSError as exc:
+        raise JwsError(T("合并下载分片失败：%s") % exc)
+    size = os.path.getsize(joined)
+    if total and size != total:
+        try:
+            os.remove(joined)
+        except OSError:
+            pass
+        raise JwsError(T("下载不完整：应为 %d 字节，实际收到 %d 字节（已保留分片，可重试续传）")
+                       % (total, size))
+    if ranged:                                     # 单连接 + 支持 Range 时也可续传
+        remember_download_speed(meter.average(size) or 0.0)
+    os.replace(joined, dst)
+    cleanup()
+    return dst
 
 
 def rruff_package(key):
@@ -4044,7 +4624,13 @@ def rruff_index_path(key):
     return os.path.join(rruff_dir(), key + ".index.csv")
 
 
-def rruff_download(key, progress=None, timeout=180, check_disk=True):
+def rruff_download(key, progress=None, timeout=None, check_disk=True, cancel=None,
+                   connections=None):
+    """下载 RRUFF 数据包 zip。
+
+    走 download_file：断点续传 + 并发分片 + 自动重试 + 长度校验；
+    下完再验一次 zip 能不能打开（长度对得上不等于压缩包没坏）。
+    """
     pkg = rruff_package(key)
     if pkg is None:
         raise JwsError(T("未知的 RRUFF 数据包：%s") % key)
@@ -4054,24 +4640,15 @@ def rruff_download(key, progress=None, timeout=180, check_disk=True):
         ok, msg = check_space(need, rruff_dir())
         if not ok:
             raise JwsError(msg)
-    tmp = dst + ".part"
-    url = _package_url(pkg)
-    req = urllib.request.Request(url, headers={"User-Agent": "SpectraTool/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+    download_file(_package_url(pkg), dst, progress=progress, cancel=cancel,
+                  connections=connections,
+                  timeout=timeout or DOWNLOAD_TIMEOUT)
+    if not zipfile.is_zipfile(dst):
         try:
-            total = int(resp.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            total = 0
-        got = 0
-        while True:
-            chunk = resp.read(1 << 16)
-            if not chunk:
-                break
-            f.write(chunk)
-            got += len(chunk)
-            if progress:
-                progress(got, total)
-    os.replace(tmp, dst)
+            os.remove(dst)
+        except OSError:
+            pass
+        raise JwsError(T("下载的压缩包打不开（传输中损坏），已删除，请重新下载。"))
     return dst
 
 
@@ -5816,6 +6393,8 @@ def _cli(args):
     out_arg = None
     report_flag = False
     cache_arg = None
+    dl_conns_arg = None
+    proxy_arg = None
     cleanup_arg = None
     import_pkgs = []
     mineral_q = None
@@ -5892,6 +6471,18 @@ def _cli(args):
                 i += 1
             else:
                 cleanup_arg = "0"
+        elif low in ("--dl-conns", "--connections"):
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                dl_conns_arg = args[i + 1]
+                i += 1
+            else:
+                dl_conns_arg = ""
+        elif low == "--proxy":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                proxy_arg = args[i + 1]
+                i += 1
+            else:
+                proxy_arg = ""
         elif low in ("--import-pkg", "--import-zip"):
             if i + 1 < len(args):
                 import_pkgs.append(args[i + 1])
@@ -6484,6 +7075,34 @@ def _cli(args):
         if len(recs) == 1:
             print("\n" + mineral_info_text(recs[0]["en"]))
         return 0
+    if dl_conns_arg is not None or proxy_arg is not None:
+        data = _load_settings()
+        if dl_conns_arg is not None:
+            if dl_conns_arg:
+                try:
+                    value = int(float(dl_conns_arg))
+                except ValueError:
+                    value = -1
+                if value < 1 or value > DOWNLOAD_CONNECTIONS_MAX:
+                    print(T("并发连接数要在 1 ~ %d 之间。") % DOWNLOAD_CONNECTIONS_MAX)
+                    return 1
+                data["download_conns"] = str(value)
+            else:
+                data.pop("download_conns", None)
+        if proxy_arg is not None:
+            if proxy_arg:
+                data["proxy"] = proxy_arg
+            else:
+                data.pop("proxy", None)
+        _save_settings(data)
+        print(T("下载并发连接数：%d（可用 --dl-conns 1~%d 调整）")
+              % (download_connections(), DOWNLOAD_CONNECTIONS_MAX))
+        print(T("下载代理：%s") % (proxy_url() or T("直连（不用代理）")))
+        sys_px = system_proxy()
+        if sys_px and not str(data.get("proxy") or "").strip():
+            print(T("（检测到 Windows 系统代理：%s，已自动使用）") % sys_px)
+        print(T("提示：跨境高丢包链路下并发数几乎决定速度；有代理 / VPN 时走代理通常更快。"))
+        return 0
     if cache_arg is not None:
         if cache_arg:
             try:
@@ -6679,7 +7298,7 @@ def _cli(args):
             return 1
         print(T("正在下载 %s（%s）…") % (pkg["label"], pkg["size"]))
         try:
-            rruff_download(rruff_get, lambda got, total: None)
+            rruff_download(rruff_get, lambda got, total, speed, eta: None)
         except Exception as exc:
             print(T("下载失败：%s") % exc)
             return 1
@@ -6712,7 +7331,7 @@ def _cli(args):
     if rruff_fetch_q:
         if not rruff_available_keys():
             print(T("本地还没有 RRUFF 数据包，先下载最小的（未评级·非定向，12 MB）…"))
-            rruff_download("unrated_unoriented", lambda got, total: None)
+            rruff_download("unrated_unoriented", lambda got, total, speed, eta: None)
             rows = rruff_index("unrated_unoriented", rebuild=True)
             print(T("索引完成：%d 条") % len(rows))
         saved, hits = rruff_export_matches(rruff_fetch_q)
@@ -8710,29 +9329,50 @@ def _run_gui():
                 initialvalue=guess, parent=self)
             if not key:
                 return
-            self._log(T("正在检索数据库：%s …") % key)
-            self.update_idletasks()
-            try:
+            self._log(T("正在检索数据库：%s …（在后台进行，界面不会卡住）") % key)
+
+            def work(report, cancel):
+                report(text=T("正在检索数据库：%s …") % key, got=0, total=0)
                 rows = rod_search(key)
-            except Exception as exc:
+                if not rows:
+                    return [], 0
+                todo = rows[:8]
+                got = 0
+                for k, row in enumerate(todo):
+                    if cancel.is_set():
+                        raise DownloadCancelled()
+                    report(text=T("正在下载候选谱线 %d/%d：%s")
+                           % (k + 1, len(todo), row["file"]), got=k, total=len(todo))
+                    try:
+                        dst, _meta = db_download(row["file"], row.get("mineral"),
+                                                 row.get("wavelength"))
+                        got += 1
+                        self._log(T("   下载 %s → %s")
+                                  % (row["file"], os.path.basename(dst)))
+                    except Exception as exc:
+                        self._log(T("   下载失败 %s：%s") % (row["file"], exc))
+                return rows, got
+
+            def done(result):
+                rows, got = result
+                if not rows:
+                    messagebox.showinfo("提示", "数据库中没有找到“%s”。" % key)
+                    return
+                self._log(T("检索到 %d 条，下载了 %d 条用于配对。") % (len(rows), got))
+                if not got and not db_list():
+                    messagebox.showwarning("提示", "没能下载到参考谱。")
+                    return
+                self._do_pair(name, (xs, ys), db_list(),
+                              "自动配对（在线，新下载 %d 条）" % got)
+
+            def failed(exc):
+                if isinstance(exc, DownloadCancelled):
+                    self._log(T("在线检索 / 下载已取消。"))
+                    return
                 messagebox.showerror("检索失败", "无法访问数据库：%s" % exc)
-                return
-            if not rows:
-                messagebox.showinfo("提示", "数据库中没有找到“%s”。" % key)
-                return
-            self._log(T("检索到 %d 条，下载前 %d 条用于配对 …") % (len(rows), min(8, len(rows))))
-            got = 0
-            for row in rows[:8]:
-                try:
-                    dst, _meta = db_download(row["file"], row.get("mineral"), row.get("wavelength"))
-                    got += 1
-                    self._log(T("   下载 %s → %s") % (row["file"], os.path.basename(dst)))
-                except Exception as exc:
-                    self._log(T("   下载失败 %s：%s") % (row["file"], exc))
-            if not got and not db_list():
-                messagebox.showwarning("提示", "没能下载到参考谱。")
-                return
-            self._do_pair(name, (xs, ys), db_list(), "自动配对（在线，新下载 %d 条）" % got)
+
+            self._bg_run(self, work, tk.StringVar(), on_done=done, on_error=failed,
+                         busy_text=T("正在连接数据库 …"))
 
         def tool_match(self):
             specs = self._selected_spectra()
@@ -9347,6 +9987,106 @@ def _run_gui():
             ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
             refresh()
 
+        def _dl_status(self, label, got, total, speed, eta):
+            """下载状态行：名称 · 已下/总数 · 速率 · 剩余时间。"""
+            parts = [label]
+            if total:
+                parts.append("%s / %s" % (format_mb(got), format_mb(total)))
+            else:
+                parts.append(format_mb(got))
+            if speed and speed > 0:
+                parts.append("%.2f MB/s" % (speed / 1048576.0))
+            if eta:
+                parts.append(T("剩余 %s") % format_eta(eta))
+            return " · ".join(parts)
+
+        def _bg_run(self, win, work, status, bar=None, cancel_btn=None,
+                    on_done=None, on_error=None, interval=200, busy_text=""):
+            """把耗时工作放后台线程跑，主线程刷新状态 / 进度条 / 取消按钮。
+
+            work(report, cancel)：report(text=, got=, total=, speed=, eta=) 更新进度，
+            cancel 是 threading.Event。这样下载十几分钟窗口也不会假死。
+            """
+            state = {"text": busy_text, "got": 0, "total": 0, "speed": 0.0,
+                     "eta": None, "done": False, "result": None, "error": None,
+                     "cancelled": False, "cancel": threading.Event()}
+            lock = threading.Lock()
+
+            def report(text=None, got=None, total=None, speed=None, eta=None):
+                with lock:
+                    if text is not None:
+                        state["text"] = text
+                    if got is not None:
+                        state["got"] = got
+                    if total is not None:
+                        state["total"] = total
+                    if speed is not None:
+                        state["speed"] = speed
+                    if eta is not None:
+                        state["eta"] = eta
+
+            def runner():
+                try:
+                    state["result"] = work(report, state["cancel"])
+                except DownloadCancelled:
+                    state["cancelled"] = True
+                except Exception as exc:
+                    state["error"] = exc
+                finally:
+                    state["done"] = True
+
+            def poll():
+                if not win.winfo_exists():
+                    return
+                with lock:
+                    snap = dict(state)
+                if cancel_btn is not None:
+                    cancel_btn.state(["disabled"] if snap["done"] else ["!disabled"])
+                if snap["text"]:
+                    status.set(snap["text"])
+                if bar is not None:
+                    if snap["total"]:
+                        if str(bar.cget("mode")) != "determinate":
+                            bar.stop()
+                            bar.configure(mode="determinate")
+                        bar.configure(value=int(1000.0 * snap["got"] / max(1, snap["total"])))
+                    elif not snap["done"]:
+                        if str(bar.cget("mode")) != "indeterminate":
+                            bar.configure(mode="indeterminate")
+                            bar.start(12)
+                if not snap["done"]:
+                    win.after(interval, poll)
+                    return
+                if bar is not None:
+                    bar.stop()
+                    bar.configure(mode="determinate", value=0)
+                if snap["cancelled"]:
+                    status.set(T("已取消。已下载的部分会保留，下次接着下。"))
+                    if on_error:
+                        on_error(DownloadCancelled())
+                    return
+                if snap["error"] is not None:
+                    if on_error:
+                        on_error(snap["error"])
+                    return
+                if on_done:
+                    on_done(snap["result"])
+
+            if cancel_btn is not None:
+                cancel_btn.configure(command=state["cancel"].set)
+            threading.Thread(target=runner, daemon=True).start()
+            win.after(interval, poll)
+
+        def _activity_bar(self, parent):
+            """对话框底部的「进度条 + 取消」栏，返回 (frame, bar, cancel_btn)。"""
+            row = ttk.Frame(parent)
+            bar = ttk.Progressbar(row, mode="determinate", maximum=1000, length=380)
+            bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            cbtn = ttk.Button(row, text=T("取消"))
+            cbtn.pack(side="left")
+            cbtn.state(["disabled"])
+            return row, bar, cbtn
+
         def open_db_search(self):
             win = tk.Toplevel(self)
             win.title("在线检索数据库 · ROD（RRUFF 拉曼数据的官方开放库）")
@@ -9366,7 +10106,7 @@ def _run_gui():
             widths = (150, 120, 170, 80, 190, 90)
             tree = ttk.Treeview(win, columns=cols, show="headings", selectmode="extended")
             for col, head, width in zip(cols, heads, widths):
-                tree.heading(col, text=head)
+                tree.heading(col, text=T(head))
                 tree.column(col, width=width, anchor="w")
             tree.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
@@ -9380,40 +10120,89 @@ def _run_gui():
                 if not key:
                     status.set(T("请输入检索词，例如 quartz / SiO2 / 石英"))
                     return
-                status.set(T("正在检索 …"))
-                win.update_idletasks()
-                try:
-                    rows = rod_search(key)
-                except Exception as exc:
+
+                def work(report, cancel):
+                    report(text=T("正在检索 …  这一步要连 solsa.crystallography.net"),
+                           got=0, total=0)
+                    return rod_search(key)
+
+                def done(rows):
+                    tree.delete(*tree.get_children())
+                    for row in rows:
+                        tree.insert("", "end", values=(
+                            row.get("mineral") or "", row.get("formula") or "",
+                            row.get("chemname") or "", row.get("wavelength") or "",
+                            row.get("devicecompany") or "", row.get("file") or ""))
+                    status.set(T("共 %d 条结果。按住 Ctrl 多选后点“下载选中谱线”。")
+                               % len(rows))
+
+                def failed(exc):
                     status.set(T("检索失败：%s（请检查网络）") % exc)
-                    return
-                tree.delete(*tree.get_children())
-                for row in rows:
-                    tree.insert("", "end", values=(
-                        row.get("mineral") or "", row.get("formula") or "",
-                        row.get("chemname") or "", row.get("wavelength") or "",
-                        row.get("devicecompany") or "", row.get("file") or ""))
-                status.set(T("共 %d 条结果。按住 Ctrl 多选后点“下载选中谱线”。") % len(rows))
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=failed,
+                             busy_text=T("正在检索 …"))
+
+            def _download_items(items, tag, specs=None):
+                """把选中的数据库谱线逐条下回来；可在下载途中取消。"""
+                def work(report, cancel):
+                    paths = []
+                    failed_n = 0
+                    for k, item in enumerate(items):
+                        if cancel.is_set():
+                            raise DownloadCancelled()
+                        values = tree.item(item, "values")
+                        rod_id, mineral, wave = values[5], values[0], values[3]
+                        report(text=T("正在下载 %d/%d：%s") % (k + 1, len(items), rod_id),
+                               got=k + 1, total=len(items))
+                        try:
+                            dst, _meta = db_download(rod_id, mineral, wave)
+                            paths.append(dst)
+                        except Exception as exc:
+                            failed_n += 1
+                            self._log(T("下载失败 %s：%s") % (rod_id, exc))
+                    return paths, failed_n
+
+                def done(result):
+                    paths, failed_n = result
+                    after_busy()
+                    if not paths:
+                        status.set(T("下载失败，没有取到任何谱线。"))
+                        return
+                    if tag == "pair":
+                        if not specs:
+                            status.set(T("没有可配对的实测谱，已下载的谱线存在本地库。"))
+                            return
+                        name, xs, ys = specs[0]
+                        self._do_pair(name, (xs, ys), paths,
+                                      "手动配对（数据库 %d 条）" % len(paths))
+                        status.set(T("已完成与 %d 条数据库谱线的配对，详见主界面日志与右侧叠加图。")
+                                   % len(paths))
+                        return
+                    msg = T("已下载 %d 条到：%s") % (len(paths), db_dir())
+                    if failed_n:
+                        msg += T("（%d 条失败，详见日志）") % failed_n
+                    status.set(msg)
+
+                def failed(exc):
+                    after_busy()
+                    if isinstance(exc, DownloadCancelled):
+                        self._log(T("下载已取消。"))
+                        return
+                    status.set(T("下载失败：%s") % exc)
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=failed,
+                             busy_text=T("正在连接数据库 …"))
 
             def do_download():
                 items = tree.selection()
                 if not items:
                     status.set(T("请先在列表中选中条目。"))
                     return
-                done = 0
-                for item in items:
-                    values = tree.item(item, "values")
-                    rod_id, mineral, wave = values[5], values[0], values[3]
-                    status.set(T("正在下载 %s …") % rod_id)
-                    win.update_idletasks()
-                    try:
-                        dst, _meta = db_download(rod_id, mineral, wave)
-                        done += 1
-                        self._log(T("已下载数据库谱线：%s") % os.path.basename(dst))
-                    except Exception as exc:
-                        status.set(T("下载失败 %s：%s") % (rod_id, exc))
-                if done:
-                    status.set(T("已下载 %d 条到：%s") % (done, db_dir()))
+                _download_items(list(items), "save")
 
             def do_add_local():
                 files = db_list()
@@ -9435,34 +10224,32 @@ def _run_gui():
                 if not specs:
                     status.set(T("请先关闭本窗口，在主界面左侧选择 1 个实测谱。"))
                     return
-                paths = []
-                for item in items:
-                    values = tree.item(item, "values")
-                    status.set(T("正在下载 %s 并配对 …") % values[5])
-                    win.update_idletasks()
-                    try:
-                        dst, _meta = db_download(values[5], values[0], values[3])
-                        paths.append(dst)
-                        self._log(T("已下载：%s") % os.path.basename(dst))
-                    except Exception as exc:
-                        self._log(T("下载失败 %s：%s") % (values[5], exc))
-                if not paths:
-                    status.set(T("下载失败，无法配对。"))
-                    return
-                name, xs, ys = specs[0]
-                self._do_pair(name, (xs, ys), paths, "手动配对（数据库 %d 条）" % len(paths))
-                status.set(T("已完成与 %d 条数据库谱线的配对，详见主界面日志与右侧叠加图。") % len(paths))
+                _download_items(list(items), "pair", specs)
 
-            ttk.Button(top, text="检索", command=do_search).pack(side="left", padx=4)
+            def after_busy():
+                for b in odb_btns:
+                    b.state(["!disabled"])
+
+            def before_busy():
+                for b in odb_btns:
+                    b.state(["disabled"])
+
+            sbtn = ttk.Button(top, text="检索", command=do_search)
+            sbtn.pack(side="left", padx=4)
             btns = ttk.Frame(win)
-            btns.pack(fill="x", padx=10, pady=(4, 10))
-            ttk.Button(btns, text="下载选中谱线", command=do_download).pack(side="left")
-            ttk.Button(btns, text="下载并与实测谱配对", command=do_pair_selected).pack(
-                side="left", padx=6)
-            ttk.Button(btns, text="把本地库加入文件列表", command=do_add_local).pack(side="left")
+            btns.pack(fill="x", padx=10, pady=(4, 2))
+            odb_btns = [sbtn]
+            for text, cmd, pad in (("下载选中谱线", do_download, 0),
+                                   ("下载并与实测谱配对", do_pair_selected, 6),
+                                   ("把本地库加入文件列表", do_add_local, 6)):
+                b = ttk.Button(btns, text=text, command=cmd)
+                b.pack(side="left", padx=(0, pad)) if pad else b.pack(side="left")
+                odb_btns.append(b)
             ttk.Button(btns, text="打开数据库文件夹",
                        command=lambda: self._open_folder(db_dir())).pack(side="left", padx=6)
             ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+            abar, bar, cancel_btn = self._activity_bar(win)
+            abar.pack(fill="x", padx=10, pady=(0, 10))
             entry.bind("<Return>", lambda _e: do_search())
 
         def open_rruff(self):
@@ -9480,13 +10267,13 @@ def _run_gui():
 
             pf = ttk.LabelFrame(win, text="① 数据包（来源 www.rruff.net/zipped_data_files）")
             pf.pack(fill="x", padx=10, pady=4)
-            ptree = ttk.Treeview(pf, columns=("state", "kind", "name", "size", "idx"),
+            ptree = ttk.Treeview(pf, columns=("state", "kind", "name", "size", "eta", "idx"),
                                  show="headings", height=min(12, len(all_packages()) + 1),
                                  selectmode="browse")
             for col, head, width in (("state", "状态", 80), ("kind", "类型", 60),
-                                     ("name", "数据包", 330), ("size", "大小", 80),
-                                     ("idx", "索引条数", 90)):
-                ptree.heading(col, text=head)
+                                     ("name", "数据包", 300), ("size", "大小", 80),
+                                     ("eta", "预计耗时", 110), ("idx", "索引条数", 90)):
+                ptree.heading(col, text=T(head))
                 ptree.column(col, width=width, anchor="w")
             ptree.pack(fill="x", padx=6, pady=6)
             pkg_info = tk.StringVar(value="")
@@ -9498,9 +10285,10 @@ def _run_gui():
                     key = pkg["key"]
                     have = os.path.exists(rruff_zip_path(key))
                     idx = _read_index(key)
+                    eta = format_eta(estimate_download_seconds(package_bytes(pkg))) or "-"
                     ptree.insert("", "end", iid=key, values=(
-                        "已下载" if have else "未下载", pkg.get("kind", ""),
-                        "%s  (%s)" % (pkg["label"], key), pkg["size"],
+                        T("已下载") if have else T("未下载"), T(pkg.get("kind", "")),
+                        "%s  (%s)" % (pkg["label"], key), pkg["size"], eta,
                         len(idx) if idx else "-"))
                 n, s = cache_usage()
                 free, total = disk_free()
@@ -9508,36 +10296,76 @@ def _run_gui():
                 extra = "" if free is None else T("　磁盘可用 %.1f GB") % (free / 1073741824.0)
                 if limit and s > limit * 1048576.0:
                     extra += T("　⚠ 已超过容量上限 %.0f MB，建议清理") % limit
-                pkg_info.set(T("数据包占用 %.1f MB / %d 个文件%s") % (s / 1048576.0, n, extra))
+                pkg_info.set(T("数据包占用 %.1f MB / %d 个文件%s") % (s / 1048576.0, n, extra)
+                             + T("　（预计耗时按上次实测速率 %.2f MB/s 估算）")
+                             % (download_speed_bps() / 1048576.0)
+                             + T("　并发 %d 路 · %s")
+                             % (download_connections(),
+                                (T("代理 %s") % proxy_url()) if proxy_url()
+                                else T("直连")))
+
+            def after_busy():
+                refresh_pkgs()
+                for b in pkg_btns:
+                    b.state(["!disabled"])
+
+            def before_busy():
+                for b in pkg_btns:
+                    b.state(["disabled"])
+
+            def dl_failed(exc):
+                after_busy()
+                if isinstance(exc, DownloadCancelled):
+                    self._log(T("下载已取消。"))
+                    return
+                status.set(T("下载失败：%s") % exc)
+                self._log(T("下载失败：%s") % exc)
 
             def do_download():
                 sel = ptree.selection()
                 if not sel:
                     status.set(T("请先选中一个数据包。"))
                     return
+                save_net()                 # 把刚才改的并发 / 代理落盘，本次下载就生效
                 key = sel[0]
                 pkg = rruff_package(key)
-
-                def prog(got, total):
-                    mb = got / 1048576.0
-                    status.set(T("正在下载 %s … %.1f%s MB") % (
-                        pkg["label"], mb, "" if not total else " / %.1f" % (total / 1048576.0)))
-                    win.update_idletasks()
-
-                try:
-                    rruff_download(key, prog)
-                except Exception as exc:
-                    status.set(T("下载失败：%s") % exc)
+                size = package_bytes(pkg)
+                if size and size >= 50 * 1048576:
+                    eta = format_eta(estimate_download_seconds(size))
+                    if not messagebox.askyesno(
+                            T("这个包比较大"),
+                            T("%s 约 %s，按实测速率预计要 %s。\n\n"
+                              "下载在后台进行，窗口不会卡住，随时可以点【取消】；"
+                              "中断后已下载的部分会保留，下次接着下，不会从头再来。\n\n"
+                              "现在开始下载吗？")
+                            % (pkg["label"], format_mb(size), eta)):
+                        return
+                existing = rruff_zip_path(key)
+                if os.path.exists(existing) and not messagebox.askyesno(
+                        T("确认覆盖"), T("%s 已经下载过了，要重新下载吗？") % pkg["label"]):
                     return
-                status.set(T("下载完成，正在建立索引（谱线较多时需一会儿）…"))
-                win.update_idletasks()
-                try:
-                    rows = rruff_index(key, rebuild=True)
-                except Exception as exc:
-                    status.set(T("建立索引失败：%s") % exc)
-                    return
-                refresh_pkgs()
-                status.set(T("完成：%s 共 %d 条，现在可以检索了。") % (pkg["label"], len(rows)))
+
+                def work(report, cancel):
+                    def prog(got, total, speed, eta):
+                        report(text=self._dl_status(
+                            T("正在下载 %s") % pkg["label"], got, total, speed, eta),
+                            got=got, total=total, speed=speed, eta=eta)
+                    rruff_download(key, prog, cancel=cancel)
+                    report(text=T("下载完成，正在建立索引（谱线较多时需一会儿）…"),
+                           got=0, total=0, speed=0.0)
+                    return rruff_index(key, rebuild=True)
+
+                def done(rows):
+                    after_busy()
+                    status.set(T("完成：%s 共 %d 条，现在可以检索了。")
+                               % (pkg["label"], len(rows or [])))
+                    self._log(T("数据包 %s 下载完成，索引 %d 条")
+                              % (pkg["label"], len(rows or [])))
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=dl_failed,
+                             busy_text=T("正在连接 %s …") % pkg["label"])
 
             def do_import():
                 path = filedialog.askopenfilename(
@@ -9545,38 +10373,99 @@ def _run_gui():
                     filetypes=[(T("ZIP 压缩包"), "*.zip"), (T("所有文件"), "*.*")])
                 if not path:
                     return
-                status.set(T("正在导入并建立索引 …"))
-                win.update_idletasks()
-                try:
-                    key, count = rruff_import_zip(path)
-                except Exception as exc:
+
+                def work(report, cancel):
+                    report(text=T("正在导入并建立索引 …"), got=0, total=0)
+                    return rruff_import_zip(path)
+
+                def done(result):
+                    after_busy()
+                    key, count = result
+                    status.set(T("导入成功：%s（索引 %d 条）。") % (key, count))
+                    self._log(T("已导入 RRUFF 数据包：%s（索引 %d 条）") % (key, count))
+
+                def failed(exc):
+                    after_busy()
                     status.set(T("导入失败：%s") % exc)
-                    return
-                refresh_pkgs()
-                status.set(T("导入成功：%s（索引 %d 条）。") % (key, count))
-                self._log(T("已导入 RRUFF 数据包：%s（索引 %d 条）") % (key, count))
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=failed,
+                             busy_text=T("正在导入 …"))
 
             def do_index():
                 sel = ptree.selection()
                 if not sel:
                     return
-                status.set(T("正在建立索引 %s …") % sel[0])
-                win.update_idletasks()
-                try:
-                    rows = rruff_index(sel[0], rebuild=True)
-                except Exception as exc:
-                    status.set(T("索引失败：%s") % exc)
-                    return
-                refresh_pkgs()
-                status.set(T("索引完成：%d 条。") % len(rows))
+                key = sel[0]
+
+                def work(report, cancel):
+                    def prog(i, n):
+                        report(text=T("正在建立索引 %d/%d …") % (i + 1, n),
+                               got=i + 1, total=n)
+                    return rruff_index(key, progress=prog, rebuild=True)
+
+                def done(rows):
+                    after_busy()
+                    status.set(T("索引完成：%d 条。") % len(rows or []))
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=lambda exc: (
+                                 after_busy(),
+                                 status.set(T("索引失败：%s") % exc)),
+                             busy_text=T("正在建立索引 %s …") % key)
 
             pbtn = ttk.Frame(pf)
             pbtn.pack(fill="x", padx=6, pady=(0, 6))
-            ttk.Button(pbtn, text="下载选中数据包并建索引", command=do_download).pack(side="left")
-            ttk.Button(pbtn, text="重建索引", command=do_index).pack(side="left", padx=6)
-            ttk.Button(pbtn, text="导入本地 zip…", command=do_import).pack(side="left", padx=6)
+            pkg_btns = []
+            for text, cmd, pad in (("下载选中数据包并建索引", do_download, 0),
+                                   ("重建索引", do_index, 6),
+                                   ("导入本地 zip…", do_import, 6)):
+                b = ttk.Button(pbtn, text=text, command=cmd)
+                b.pack(side="left", padx=(0, pad)) if pad else b.pack(side="left")
+                pkg_btns.append(b)
             ttk.Button(pbtn, text="清理数据包…",
                        command=lambda: self.open_data_manager()).pack(side="left", padx=6)
+
+            netf = ttk.Frame(pf)
+            netf.pack(fill="x", padx=6, pady=(0, 4))
+            ttk.Label(netf, text=T("并发连接数：")).pack(side="left")
+            conn_var = tk.StringVar(value=str(download_connections()))
+            conn_entry = ttk.Spinbox(netf, from_=1, to=DOWNLOAD_CONNECTIONS_MAX, width=5,
+                                     textvariable=conn_var)
+            conn_entry.pack(side="left")
+            ttk.Label(netf, text=T("（1~%d，越大越快）") % DOWNLOAD_CONNECTIONS_MAX,
+                      foreground="#888").pack(side="left", padx=4)
+            ttk.Label(netf, text=T("代理：")).pack(side="left", padx=(10, 2))
+            proxy_var = tk.StringVar(value=str(_load_settings().get("proxy") or ""))
+            proxy_entry = ttk.Entry(netf, textvariable=proxy_var, width=20)
+            proxy_entry.pack(side="left")
+            ttk.Label(netf, text=T("（留空 = 自动用系统代理；none = 强制直连）"),
+                      foreground="#888").pack(side="left", padx=4)
+
+            def save_net():
+                data = _load_settings()
+                try:
+                    value = int(float(conn_var.get()))
+                    if 1 <= value <= DOWNLOAD_CONNECTIONS_MAX:
+                        data["download_conns"] = str(value)
+                except (TypeError, ValueError):
+                    pass
+                px = proxy_var.get().strip()
+                if px:
+                    data["proxy"] = px
+                else:
+                    data.pop("proxy", None)
+                _save_settings(data)
+                refresh_pkgs()
+
+            for _w in (conn_entry, proxy_entry):
+                _w.bind("<Return>", lambda _e: save_net())
+                _w.bind("<FocusOut>", lambda _e: save_net())
+
+            abar, bar, cancel_btn = self._activity_bar(pf)
+            abar.pack(fill="x", padx=6, pady=(0, 6))
 
             sf = ttk.LabelFrame(win, text="② 按矿物名 / RRUFF 编号检索（需先下载任一数据包）")
             sf.pack(fill="both", expand=True, padx=10, pady=4)
@@ -9591,7 +10480,7 @@ def _run_gui():
             for col, head, width in (("min", "矿物", 150), ("id", "编号", 90),
                                      ("wave", "波长(nm)", 80), ("type", "类型", 140),
                                      ("pkg", "数据包", 160)):
-                rtree.heading(col, text=head)
+                rtree.heading(col, text=T(head))
                 rtree.column(col, width=width, anchor="w")
             rtree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
             cache = {"rows": []}
@@ -9666,70 +10555,99 @@ def _run_gui():
                 if not mineral:
                     status.set(T("请输入矿物名，例如 Zircon / Quartz。"))
                     return
-                if not rruff_available_keys():
-                    if not messagebox.askyesno(
-                            "需要先下载数据包",
-                            "本地还没有 RRUFF 数据包。\n"
-                            "是否现在下载最小的数据包（未评级·非定向，12 MB）？"):
-                        return
-                    status.set(T("正在下载 12 MB 数据包 …"))
-                    win.update_idletasks()
+                save_net()
 
-                    def p1(got, total):
-                        status.set(T("下载中 %.1f%s MB") % (
-                            got / 1048576.0, "" if not total else " / %.1f" % (total / 1048576.0)))
-                        win.update_idletasks()
-
-                    try:
-                        rruff_download("unrated_unoriented", p1)
-                        rruff_index("unrated_unoriented", rebuild=True)
-                    except Exception as exc:
-                        status.set(T("下载失败：%s") % exc)
-                        return
-                    refresh_pkgs()
-
-                saved, hits = rruff_export_matches(mineral)
-                if hits == 0:
+                def plan():
+                    """主线程里定好要下哪些包（可能要弹窗确认），再交给后台跑。"""
+                    done_saved, done_hits = rruff_export_matches(mineral)
+                    if done_hits:
+                        return None, done_saved, done_hits
+                    if not rruff_available_keys():
+                        if not messagebox.askyesno(
+                                "需要先下载数据包",
+                                "本地还没有 RRUFF 数据包。\n"
+                                "是否现在下载最小的数据包（未评级·非定向，12 MB）？"):
+                            return [], [], 0
+                        return [rruff_package("unrated_unoriented")], [], 0
                     missing = [p for p in rruff_packages_sorted()
                                if not os.path.exists(rruff_zip_path(p["key"]))]
                     if not missing:
-                        status.set(T("所有数据包中都没有找到 \"%s\"。") % mineral)
-                        return
-                    listing = "\n".join("   %s（%s）" % (p["label"], p["size"]) for p in missing)
+                        return [], [], 0
+                    listing = "\n".join("   %s（%s）" % (p["label"], p["size"])
+                                        for p in missing)
                     if not messagebox.askyesno(
                             "未找到，是否下载更大的数据包？",
-                            "已下载的数据包里没有 \"%s\"。\n\n可依次下载以下数据包并自动重试：\n%s"
-                            % (mineral, listing)):
-                        status.set(T("已取消。可在上方选择数据包手动下载。"))
-                        return
-                    for pkg in missing:
-                        status.set(T("正在下载 %s …") % pkg["label"])
-                        win.update_idletasks()
+                            "已下载的数据包里没有 \"%s\"。\n\n"
+                            "可依次下载以下数据包并自动重试：\n%s" % (mineral, listing)):
+                        return [], [], 0
+                    return missing, [], 0
 
-                        def p2(got, total, label=pkg["label"]):
-                            status.set(T("下载 %s %.1f MB") % (label, got / 1048576.0))
-                            win.update_idletasks()
-
-                        try:
-                            rruff_download(pkg["key"], p2)
-                            rruff_index(pkg["key"], rebuild=True)
-                        except Exception as exc:
-                            self._log(T("下载失败 %s：%s") % (pkg["key"], exc))
-                            continue
-                        refresh_pkgs()
-                        saved, hits = rruff_export_matches(mineral)
-                        if hits:
-                            break
-                if hits:
+                todo, saved, hits = plan()
+                if todo is None:
                     do_search()
                     status.set(T("已按矿物批量抓取 \"%s\"：命中 %d 条，导出 %d 条到本地库。")
                                % (mineral, hits, len(saved)))
-                    self._log(T("RRUFF 按矿物抓取 \"%s\"：命中 %d 条，导出 %d 条到 %s")
-                              % (mineral, hits, len(saved), db_dir()))
-                    for path in saved:
-                        self._log("   " + os.path.basename(path))
-                else:
-                    status.set(T("所有数据包中都没有找到 \"%s\"。") % mineral)
+                    return
+                if not todo:
+                    if not hits:
+                        status.set(T("所有数据包中都没有找到 \"%s\"。") % mineral)
+                    return
+
+                def work(report, cancel):
+                    total_mb = sum(package_bytes(p) for p in todo) / 1048576.0
+                    report(text=T("批量抓取 \"%s\"：需下载 %d 个包，共约 %.0f MB")
+                           % (mineral, len(todo), total_mb), got=0, total=0)
+                    out_saved, out_hits = [], 0
+                    for k, pkg in enumerate(todo):
+                        if cancel.is_set():
+                            raise DownloadCancelled()
+                        report(text=T("正在下载 %s（第 %d/%d 个包，%s）")
+                               % (pkg["label"], k + 1, len(todo), pkg["size"]),
+                               got=0, total=0)
+
+                        def prog(got, total, speed, eta, label=pkg["label"]):
+                            report(text=self._dl_status(
+                                T("正在下载 %s") % label, got, total, speed, eta),
+                                got=got, total=total, speed=speed, eta=eta)
+
+                        rruff_download(pkg["key"], prog, cancel=cancel)
+                        report(text=T("正在建立索引 %s …") % pkg["label"],
+                               got=0, total=0)
+                        rruff_index(pkg["key"], rebuild=True)
+                        out_saved, out_hits = rruff_export_matches(mineral)
+                        if out_hits:
+                            break
+                    return out_saved, out_hits
+
+                def done(result):
+                    after_busy()
+                    got_saved, got_hits = result
+                    refresh_pkgs()
+                    if got_hits:
+                        do_search()
+                        status.set(T("已按矿物批量抓取 \"%s\"：命中 %d 条，导出 %d 条到本地库。")
+                                   % (mineral, got_hits, len(got_saved)))
+                        self._log(T("RRUFF 按矿物抓取 \"%s\"：命中 %d 条，导出 %d 条到 %s")
+                                  % (mineral, got_hits, len(got_saved), db_dir()))
+                        for path in got_saved:
+                            self._log("   " + os.path.basename(path))
+                    else:
+                        status.set(T("所有数据包中都没有找到 \"%s\"。") % mineral)
+
+                def failed(exc):
+                    after_busy()
+                    refresh_pkgs()
+                    if isinstance(exc, DownloadCancelled):
+                        status.set(T("已取消。已下载的部分会保留，下次接着下。"))
+                        self._log(T("按矿物抓取已取消。"))
+                        return
+                    status.set(T("抓取失败：%s") % exc)
+                    self._log(T("抓取失败：%s") % exc)
+
+                before_busy()
+                self._bg_run(win, work, status, bar=bar, cancel_btn=cancel_btn,
+                             on_done=done, on_error=failed,
+                             busy_text=T("正在准备批量抓取 …"))
 
             ttk.Button(srow, text="检索", command=do_search).pack(side="left", padx=4)
             ttk.Button(srow, text="按矿物批量抓取（自动下载+导出）", command=do_fetch).pack(
@@ -10622,7 +11540,7 @@ def _run_gui():
     app.mainloop()
 
 
-_MANUAL_VERSION = "2.3"
+_MANUAL_VERSION = "2.4"
 _MANUAL_TITLE = "拉曼光谱工具 · 使用说明书"
 _MANUAL_MARKER = "（说明书版本：%s）" % _MANUAL_VERSION
 _MANUAL_MARKER_EN = "(guide version: %s)" % _MANUAL_VERSION
@@ -11077,6 +11995,70 @@ ERR 叠加图 -> %s||ERR overlay -> %s
 叠加图：%s（标注 %d 个峰位）||Overlay: %s (%d peaks marked)
 预览需要 Pillow（pip install pillow）。||The preview needs Pillow (pip install pillow).
 (留空 = 最小峰间距)||(blank = minimum peak separation)
+不到 1 分钟||under a minute
+约 %.0f 分钟||about %.0f min
+约 %d 小时||about %d h
+约 %d 小时 %d 分钟||about %d h %d min
+剩余 %s||%s left
+取消下载||Cancel download
+状态||Status
+类型||Type
+数据包||Package
+大小||Size
+预计耗时||Estimated time
+索引条数||Indexed rows
+已下载||Downloaded
+未下载||Not downloaded
+　（预计耗时按上次实测速率 %.2f MB/s 估算）||  (estimated at the last measured %.2f MB/s)
+正在下载 %s||Downloading %s
+正在连接 %s …||Connecting to %s ...
+正在连接数据库 …||Connecting to the database ...
+正在导入 …||Importing ...
+正在建立索引 %d/%d …||Building the index %d/%d ...
+正在检索 …  这一步要连 solsa.crystallography.net||Searching ... this step contacts solsa.crystallography.net
+正在检索数据库：%s …（在后台进行，界面不会卡住）||Searching the database: %s ... (runs in the background; the window stays responsive)
+正在下载 %d/%d：%s||Downloading %d/%d: %s
+正在下载候选谱线 %d/%d：%s||Downloading candidate spectra %d/%d: %s
+检索到 %d 条，下载了 %d 条用于配对。||Found %d entries; downloaded %d of them for pairing.
+下载已取消。||Download cancelled.
+已取消。已下载的部分会保留，下次接着下。||Cancelled. What was already downloaded is kept and the next run continues from there.
+在线检索 / 下载已取消。||Online search / download cancelled.
+下载失败，没有取到任何谱线。||Download failed; no spectrum was retrieved.
+正在准备批量抓取 …||Preparing the bulk fetch ...
+批量抓取 "%s"：需下载 %d 个包，共约 %.0f MB||Bulk fetch of "%s": %d package(s) to download, about %.0f MB in total
+正在下载 %s（第 %d/%d 个包，%s）||Downloading %s (package %d/%d, %s)
+按矿物抓取已取消。||Bulk fetch by mineral cancelled.
+抓取失败：%s||Bulk fetch failed: %s
+并发连接数：||Parallel connections:
+（1~%d，越大越快）||(1~%d; higher is faster)
+代理：||Proxy:
+（留空 = 自动用系统代理；none = 强制直连）||(blank = use the Windows system proxy automatically; "none" = force a direct connection)
+直连||direct
+直连（不用代理）||direct (no proxy)
+　并发 %d 路 · %s||  %d connections · %s
+代理 %s||proxy %s
+服务器多次限流（HTTP %s），请把并发连接数调小些再试。||  The server throttled us repeatedly (HTTP %s); lower the number of parallel connections and retry.
+并发连接数要在 1 ~ %d 之间。||Parallel connections must be between 1 and %d.
+下载并发连接数：%d（可用 --dl-conns 1~%d 调整）||Download concurrency: %d (change it with --dl-conns 1~%d)
+下载代理：%s||Download proxy: %s
+（检测到 Windows 系统代理：%s，已自动使用）||(Windows system proxy detected: %s - used automatically)
+提示：跨境高丢包链路下并发数几乎决定速度；有代理 / VPN 时走代理通常更快。||Tip: on a long, lossy international link the number of parallel connections almost determines the speed; if you have a proxy or VPN, going through it is usually much faster.
+（%d 条失败，详见日志）||(%d failed; see the log)
+没有可配对的实测谱，已下载的谱线存在本地库。||No measured spectrum to pair with; the downloaded spectra are in the local library.
+这个包比较大||This package is large
+%s 已经下载过了，要重新下载吗？||%s has already been downloaded. Download it again?
+确认覆盖||Confirm overwrite
+数据包 %s 下载完成，索引 %d 条||Package %s downloaded; %d rows indexed
+服务器不支持断点续传（HTTP %s）||The server does not support resuming (HTTP %s)
+连接提前中断（本段还差 %d 字节）||The connection dropped early (%d bytes still missing for this part)
+下载失败（重试 %d 次仍未完成）：%s||Download failed (still incomplete after %d retries): %s
+合并下载分片失败：%s||Merging the download parts failed: %s
+下载不完整：应为 %d 字节，实际收到 %d 字节（已保留分片，可重试续传）||Incomplete download: expected %d bytes, got %d (parts kept; the next run resumes)
+下载的压缩包打不开（传输中损坏），已删除，请重新下载。||The downloaded archive cannot be opened (damaged in transit); it has been deleted, please download again.
+响应过大（超过 %d MB），已放弃||Response too large (over %d MB); aborted
+网络请求失败（重试 %d 次）：%s||Network request failed (after %d retries): %s
+光谱数据不完整：应为 %d 点，实际收到 %d 点（可稍后重试）||Incomplete spectrum data: expected %d points, got %d (try again later)
+%s 约 %s，按实测速率预计要 %s。\\n\\n下载在后台进行，窗口不会卡住，随时可以点【取消】；中断后已下载的部分会保留，下次接着下，不会从头再来。\\n\\n现在开始下载吗？||%s is about %s; at the measured rate that takes roughly %s.\\n\\nThe download runs in the background so the window stays responsive, and you can press "Cancel" at any time. Whatever has already been downloaded is kept, so the next run continues from there instead of starting over.\\n\\nStart the download now?
 == 批量配对汇总 ==\\n||== Batch pairing summary ==\\n
 == 批量未知谱鉴定汇总 ==\\n||== Batch identification summary ==\\n
 批量配对汇总||Batch pairing summary
@@ -12131,7 +13113,37 @@ _MANUAL_SECTIONS = [
 锆石 Zircon R050034）+ 17 条已导出的参考谱，开箱即可离线检索。
 
 数据包比较大（红外 14 MB、XRD 67 MB、成分 19 MB，拉曼 12~229 MB），
-下载前工具会先检查磁盘空间，超容量上限也会提醒。"""),
+下载前工具会先检查磁盘空间，超容量上限也会提醒。
+
+下载慢 / 掉线怎么办（重要）
+  rruff.net 在国外，瓶颈是这条跨境链路（实测 ping 丢包 25%、RTT 236 ms），
+  不是工具的问题。实测吞吐几乎正比于同时在跑的连接数（服务器全程没有拒绝）：
+  1 路约 0.03、8 路约 0.32、32 路约 0.89、64 路约 1.28、96 路约 1.45 MB/s
+  （同一次测量的结果；这条链路随时段波动很大，绝对值能差 2~3 倍，
+  但“连接数越多越快”这个趋势是稳定的）。
+  所以以前下 227 MB 要 40 多分钟，中途一断还从头再来。现在下载改成了这样：
+    · 后台下载：进度条 + 已下/总数 + 实时速率 + 剩余时间，窗口照常能点，
+      不会再假死（以前用的是 update_idletasks，整段时间鼠标和关闭都不响应）；
+    · 【取消】随时可点。中断后**已下载的部分会保留**，下次接着下，不从 0 重来；
+    · 并发连接数默认 32 路，可在下载对话框里调（1~128），命令行 --dl-conns 96 也行。
+      为了不把时间都花在握手上，每个连接至少分到 256 KB 的活，小包不会硬开几十路；
+    · 动态领活：不是“把文件平均分给 N 条连接”，而是切成小段排队、谁下完谁再领。
+      同一个 33 MB 的包，32 等分里最快那段 4.3 s、最慢那段 79 s——静态均分等于
+      花 79 s 等一条卡住的连接；真实链路同一时段交错 A/B（12 MB 的包、都是 32 路）
+      显示：静态均分平均 39.1 s → 动态领活平均 23.2 s，快 1.69 倍；
+    · 代理：这条链路丢包严重，走代理 / VPN 往往比堆并发更快。
+      在下载对话框里填代理地址（留空则沿用 Windows 系统代理），或命令行 --proxy；
+    · 自动重试：断线按 1.5×n 秒退避重试，并且从断点继续，不是整段重下；
+      服务器返回 429/503 会识别出来，并提示把并发调小些；
+    · 完整性校验：长度对不上就不算下载成功，**残缺文件不会被当成已下载**
+      （以前会——建索引时才报错，看着就像又崩了一次）；
+      下完再验一次 zip 能不能打开，坏了自动删掉并提示重试；
+    · 取消或强杀留下的 .part0 / .part1 分片就是断点，不会被当成正式数据包。
+  数据包表里的「预计耗时」按你上次实测到的速率估算，会越用越准；
+  下大包（≥ 50 MB）前会弹窗告知预计时长，可以先挑小包用。
+  如果确实太慢：先下 fair_oriented（271 KB）或 powder_DIF（7.6 MB）练手，
+  或者把并发拉到 64~96 试试，再或者在能直连的网络上用浏览器从官网下载 zip，
+  再用【导入本地 zip…】。"""),
 
     ("11. 配对比较与未知谱鉴定", """◆ 未知光谱检索（全库鉴定，不依赖矿物名）
 
@@ -12890,7 +13902,52 @@ Where the files go
 
 An index is built when a package is downloaded; you can rebuild it with
 [Database -> ...] or with --identify-index. Deleting a package also deletes its
-indexes."""),
+indexes.
+
+When downloads are slow or keep dropping (important)
+  rruff.net is outside China, so the bottleneck is this cross-border link
+  (measured: 25% packet loss, 236 ms RTT) rather than a bug in the tool.
+  Measured throughput is roughly proportional to the number of connections
+  running at the same time (the server never refused): about 0.03 MB/s at 1,
+  0.32 at 8, 0.89 at 32, 1.28 at 64 and 1.45 MB/s at 96 connections (all from
+  one measurement session; this link swings 2-3x with the time of day, but the
+  "more connections is faster" trend is stable).
+  That is why the 227 MB package used to take over 40 minutes and had to start
+  over after any interruption. Now:
+    . the download runs in the BACKGROUND: progress bar + downloaded/total +
+      live speed + time left, and the window stays clickable (it used to call
+      update_idletasks, so the mouse and the close button were dead the whole time);
+    . "Cancel" works at any moment. Whatever has been downloaded is KEPT and
+      the next run continues from there instead of starting over;
+    . 32 parallel connections by default, adjustable in the download dialog
+      (1-128) or with --dl-conns 96. Each connection is guaranteed at least
+      256 KB of work so a small package does not spend everything on handshakes;
+    . work-stealing: instead of splitting the file into N equal shards (one per
+      connection) it is cut into work units in a queue and whichever connection
+      finishes grabs the next one. On the same 33 MB package the fastest of 32
+      equal shards needed 4.3 s and the slowest needed 79 s - equal shards mean
+      waiting 79 s for one stalled connection. Interleaved A/B on the real link
+      (12 MB package, 32 connections both ways) gave 39.1 s average for equal
+      shards vs 23.2 s with work stealing, i.e. 1.69x faster;
+    . proxy: on this lossy link a proxy or VPN is often faster than piling on
+      connections. Enter one in the download dialog (blank reuses the Windows
+      system proxy) or use --proxy;
+    . automatic retries: a dropped connection is retried after 1.5 x n seconds
+      and resumes from where it stopped, not from the beginning of the part;
+      a 429/503 from the server is detected and reported with a hint to lower
+      the concurrency;
+    . integrity check: if the byte count does not match it is NOT counted as a
+      successful download (it used to be - the failure only surfaced later when
+      the index was built, which looked like another crash); the finished file is
+      also checked as a zip, and a damaged one is deleted with a message to retry;
+    . the .part0 / .part1 files left by a cancel or a force-kill are the resume
+      points and are never mistaken for a real package.
+  The "estimated time" column uses the speed measured on YOUR last download, so
+  it gets more accurate over time. Packages of 50 MB or more ask for confirmation
+  first, and you can start with a small one.
+  If it is genuinely too slow: try fair_oriented (271 KB) or powder_DIF (7.6 MB)
+  first, or raise the concurrency to 64-96, or download the zip in a browser on
+  a well-connected network and use "Import local zip..."."""),
 
     ("11. Pairing and unknown-spectrum identification", """Unknown-spectrum search (whole-library identification, no mineral name needed)
 

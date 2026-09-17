@@ -1,6 +1,6 @@
 ﻿Raman Spectrum Toolkit  User Guide
 (JASCO .jws conversion - Raman peak analysis - mineral identification)
-(guide version: 2.3)
+(guide version: 2.4)
 ============================================================
 
 In one sentence:
@@ -374,6 +374,51 @@ Where the files go
 An index is built when a package is downloaded; you can rebuild it with
 [Database -> ...] or with --identify-index. Deleting a package also deletes its
 indexes.
+
+When downloads are slow or keep dropping (important)
+  rruff.net is outside China, so the bottleneck is this cross-border link
+  (measured: 25% packet loss, 236 ms RTT) rather than a bug in the tool.
+  Measured throughput is roughly proportional to the number of connections
+  running at the same time (the server never refused): about 0.03 MB/s at 1,
+  0.32 at 8, 0.89 at 32, 1.28 at 64 and 1.45 MB/s at 96 connections (all from
+  one measurement session; this link swings 2-3x with the time of day, but the
+  "more connections is faster" trend is stable).
+  That is why the 227 MB package used to take over 40 minutes and had to start
+  over after any interruption. Now:
+    . the download runs in the BACKGROUND: progress bar + downloaded/total +
+      live speed + time left, and the window stays clickable (it used to call
+      update_idletasks, so the mouse and the close button were dead the whole time);
+    . "Cancel" works at any moment. Whatever has been downloaded is KEPT and
+      the next run continues from there instead of starting over;
+    . 32 parallel connections by default, adjustable in the download dialog
+      (1-128) or with --dl-conns 96. Each connection is guaranteed at least
+      256 KB of work so a small package does not spend everything on handshakes;
+    . work-stealing: instead of splitting the file into N equal shards (one per
+      connection) it is cut into work units in a queue and whichever connection
+      finishes grabs the next one. On the same 33 MB package the fastest of 32
+      equal shards needed 4.3 s and the slowest needed 79 s - equal shards mean
+      waiting 79 s for one stalled connection. Interleaved A/B on the real link
+      (12 MB package, 32 connections both ways) gave 39.1 s average for equal
+      shards vs 23.2 s with work stealing, i.e. 1.69x faster;
+    . proxy: on this lossy link a proxy or VPN is often faster than piling on
+      connections. Enter one in the download dialog (blank reuses the Windows
+      system proxy) or use --proxy;
+    . automatic retries: a dropped connection is retried after 1.5 x n seconds
+      and resumes from where it stopped, not from the beginning of the part;
+      a 429/503 from the server is detected and reported with a hint to lower
+      the concurrency;
+    . integrity check: if the byte count does not match it is NOT counted as a
+      successful download (it used to be - the failure only surfaced later when
+      the index was built, which looked like another crash); the finished file is
+      also checked as a zip, and a damaged one is deleted with a message to retry;
+    . the .part0 / .part1 files left by a cancel or a force-kill are the resume
+      points and are never mistaken for a real package.
+  The "estimated time" column uses the speed measured on YOUR last download, so
+  it gets more accurate over time. Packages of 50 MB or more ask for confirmation
+  first, and you can start with a small one.
+  If it is genuinely too slow: try fair_oriented (271 KB) or powder_DIF (7.6 MB)
+  first, or raise the concurrency to 64-96, or download the zip in a browser on
+  a well-connected network and use "Import local zip...".
 
 ============================================================
 11. Pairing and unknown-spectrum identification

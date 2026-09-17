@@ -24,6 +24,11 @@ BUILD = os.path.join(ROOT, "_build_release")
 STAGE = os.path.join(BUILD, "stage")
 EXE = "RamanSpectrumToolkit.exe"
 PKG = "RamanSpectrumToolkit"
+# 随包附带的“起步数据包”（README / 说明书里承诺的开箱即可离线检索那一份）。
+# 不能整个目录照搬：用户自己下载的大包动辄几百 MB，会把 39 MB 的发布包撑到 460 MB。
+BUNDLED_PACKAGES = ("unrated_unoriented.zip",
+                    "unrated_unoriented.index.csv",
+                    "unrated_unoriented.peaks.csv")
 
 
 def version():
@@ -74,8 +79,11 @@ def stage_package(exe_path):
         copy_into(os.path.join(ASSETS, name), os.path.join(target, "assets", name))
 
     data = os.path.join(ROOT, "工具数据")
-    for sub in ("参考谱库", "RRUFF数据包"):
-        copy_into(os.path.join(data, sub), os.path.join(target, "工具数据", sub))
+    copy_into(os.path.join(data, "参考谱库"),
+              os.path.join(target, "工具数据", "参考谱库"))
+    for name in BUNDLED_PACKAGES:
+        copy_into(os.path.join(data, "RRUFF数据包", name),
+                  os.path.join(target, "工具数据", "RRUFF数据包", name))
     copy_into(os.path.join(data, "分析结果", "_说明.txt"),
               os.path.join(target, "工具数据", "分析结果", "_说明.txt"))
 
