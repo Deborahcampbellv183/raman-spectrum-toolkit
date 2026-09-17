@@ -33,7 +33,7 @@
 | **配对比较** | 实测谱 ↔ 标准谱手动/自动配对，输出峰位匹配 F1、相关系数、谱角与对照报告图 |
 | **预处理** | 尖峰（宇宙射线）去除、基线校正、平滑、导数、归一化、拉曼位移校准 |
 | **统计分析** | 层次聚类 + PCA、二维成像热图、平均/相减、谱段替换、交互式 A−k·B 找平 |
-| **多谱对照** | **瀑布图**（纵向错开，看有哪些峰）+ **多数据图叠加**（同轴叠画、**每条数据集一种颜色**、横坐标自动取各条的**交集**、可隐藏峰位数值、导出 PNG） |
+| **多谱对照** | **瀑布图**（纵向错开，看有哪些峰）+ **多数据图叠加**（按 stacked spectra 排布：各条**上下错开、谱线分开**，每条一色带图例；**峰位跨谱合并，一个峰只画一条虚线、只标一个平均波数**；**先预览、左键加峰 / 右键删峰，确认后再导出**；横坐标取各条**交集**，可导出 PNG） |
 | **批量与报告** | 整目录批处理 + 汇总表、自包含 HTML 分析报告（图片内嵌，可打印成 PDF） |
 
 <table>
@@ -51,7 +51,7 @@
 
 <img src="docs/example_overlay.png" alt="多数据图叠加">
 
-<sub><b>多数据图叠加</b> — 4 条光谱叠画在同一套坐标轴上，每条数据集一种颜色（默认各条归一化到最大值 = 1），一键导出 PNG</sub>
+<sub><b>多数据图叠加</b> — 4 条光谱按 stacked spectra 上下错开、谱线分开，每条一色；峰位跨谱合并后<b>一个峰只画一条虚线、只标一个平均波数</b>。打开先出预览窗口，<b>左键加峰、右键删峰</b>，确认后再导出 PNG</sub>
 
 </div>
 
@@ -87,7 +87,7 @@ python jws2csv.py --mineral-info Zircon      # 矿物信息卡（特征峰归属
 python jws2csv.py --cluster 文件夹           # 聚类分析 + 主成分
 python jws2csv.py --map 5,5 --map-metric main_peak   # 二维成像热图
 python jws2csv.py --waterfall 文件夹         # 瀑布图（纵向错开）
-python jws2csv.py --overlay 文件夹           # 多数据图叠加（每条一色，导出 PNG）
+python jws2csv.py --overlay 文件夹           # 多数据图叠加（每条一色，批处理无预览）
 python jws2csv.py --report 文件夹            # 自包含 HTML 分析报告
 python jws2csv.py --lang en|zh               # 切换界面/输出语言
 python jws2csv.py --manual                   # 打印完整说明书
@@ -151,7 +151,7 @@ The GUI, CLI, reports and manuals are **fully bilingual (Chinese / English)**.
 | **Pairing** | measured ↔ reference pairing (manual or automatic) with peak-match F1, correlation, spectral angle, and a comparison report figure |
 | **Preprocessing** | spike (cosmic ray) removal, baseline correction, smoothing, derivative, normalization, Raman shift calibration |
 | **Statistics** | hierarchical clustering + PCA, 2D imaging heat map, average / subtract, range replacement, interactive A−k·B flattening |
-| **Multi-spectrum comparison** | **waterfall** (offset stacks, to see *which* peaks are there) + **multi-dataset overlay** (shared axes, **one colour per dataset**, x axis automatically the **intersection** of all ranges, peak values can be hidden, exportable as PNG) |
+| **Multi-spectrum comparison** | **waterfall** (offset stacks, to see *which* peaks are there) + **multi-dataset overlay** (stacked-spectra layout: curves **offset and separated**, one colour each with a legend; **peaks merged across datasets — one dashed line and one averaged value per peak**; **preview first, left-click to add / right-click to remove peaks, export only after you confirm**; x axis is the **intersection** of all ranges) |
 | **Batch & reports** | whole-folder batch conversion with a summary table, self-contained HTML report (images embedded, printable to PDF) |
 
 ### Quick start
@@ -178,7 +178,7 @@ python jws2csv.py --identify unknown.csv    # identify an unknown spectrum
 python jws2csv.py --pair unknown.csv        # pair against your local library
 python jws2csv.py --rruff-fetch Zircon      # download + index + export Zircon references
 python jws2csv.py --waterfall folder        # waterfall chart (offset stacks)
-python jws2csv.py --overlay folder          # multi-dataset overlay, one colour each
+python jws2csv.py --overlay folder          # multi-dataset overlay, one colour each (batch, no preview)
 python jws2csv.py --report folder           # self-contained HTML analysis report
 python jws2csv.py --lang en|zh              # switch UI / output language
 python jws2csv.py --manual                  # print the full user guide

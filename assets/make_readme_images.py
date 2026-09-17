@@ -39,7 +39,7 @@ if results:
 else:
     print("pairing produced no results")
 
-# 3) 多数据图叠加：几种矿物的参考谱叠在同一套坐标轴上，每条一色
+# 3) 多数据图叠加（堆叠排布）：几种矿物的参考谱错开排列，峰位跨谱合并只标一个平均值
 WANT = ("Zircon_R050034_785nm.csv", "Hematite_1000001_514nm.csv",
         "Gypsum_3500028_514nm.csv", "Dolomite_1000016_514nm.csv")
 ov = []
@@ -49,9 +49,9 @@ for name in WANT:
         continue
     _l2, s2 = T.read_any_series(q)
     ov.append((name[:-4].replace("_", " "), list(s2[0][1]), list(s2[0][2])))
-po = T._plot_opts({"x_step": 200})
-po["annotate_peaks"] = False
+po = T._plot_opts({"x_step": 200, "peak_merge_tol": 20.0, "stack_offset": 1.0})
+po["annotate_peaks"] = True
 T.render_overlay(os.path.join(OUT, "example_overlay.png"), ov,
-                 "Multi-dataset overlay  -  reference spectra, one colour each",
+                 "Multi-dataset overlay  -  stacked spectra, peaks merged across datasets",
                  T._DEFAULT_X_HEADER, "Normalized intensity", po)
 print("example_overlay.png ok,", len(ov), "curves ->", [c[0] for c in ov])

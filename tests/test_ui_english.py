@@ -244,7 +244,7 @@ def fake_mainloop(self):
         check("%s 日志无中文残留" % name, not bad,
               "残留 %d 处：%s" % (len(bad), bad[:4]))
 
-    # 多数据图叠加：打开对话框 → 点“生成并导出” → 确认 PNG 真的落盘
+    # 多数据图叠加：先开预览窗口 → 点“Export PNG”确认导出 → 确认 PNG 真的落盘
     before = {id(w) for w in app.winfo_children() if isinstance(w, tk.Toplevel)}
     app.log.configure(state="normal")
     app.log.delete("1.0", "end")
@@ -261,7 +261,7 @@ def fake_mainloop(self):
             dlg.update()
             btns = [w for w in collect(dlg) if w.winfo_class() == "TButton"]
             labels = [str(w.cget("text")) for w in btns]
-            hit = [w for w in btns if str(w.cget("text")) == "Render and export"]
+            hit = [w for w in btns if str(w.cget("text")) == "Export PNG"]
             check("叠加图对话框有导出按钮", bool(hit), str(labels))
             if hit:
                 hit[0].invoke()
@@ -269,8 +269,12 @@ def fake_mainloop(self):
             app.log.configure(state="normal")
             lines = app.log.get("1.0", "end").splitlines()
             app.log.configure(state="disabled")
-            names = [ln.split(":", 1)[1].strip() for ln in lines
-                     if ln.strip().startswith("Overlay:") and ":" in ln]
+            names = []
+            for ln in lines:
+                ln = ln.strip()
+                if ln.startswith("Overlay:") and ":" in ln:
+                    nm = ln.split(":", 1)[1].strip()
+                    names.append(re.sub(r"\s*\(.*\)$", "", nm))
             path = os.path.join(T.results_dir(), names[-1]) if names else ""
             check("叠加图已导出 PNG",
                   bool(path) and os.path.isfile(path) and os.path.getsize(path) > 10000,

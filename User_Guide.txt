@@ -1,6 +1,6 @@
 ﻿Raman Spectrum Toolkit  User Guide
 (JASCO .jws conversion - Raman peak analysis - mineral identification)
-(guide version: 2.1)
+(guide version: 2.2)
 ============================================================
 
 In one sentence:
@@ -462,10 +462,26 @@ All in the [Analysis] menu.
                                spectrum, with a linear transition at the edges
   Waterfall                    many spectra stacked with a vertical offset
   Multi-dataset overlay        [Analysis -> Multi-dataset overlay (selected
-                               spectra)...] or --overlay on the command line.
-                               No vertical offset: every dataset is drawn on the
-                               same axes, one colour per dataset, so you compare
-                               spectral shapes rather than peak lists.
+  (stacked)                    spectra)...] or --overlay on the command line.
+                               Drawn the way stacked-spectra figures are: each
+                               curve is normalized to max = 1 and then offset
+                               vertically by k x "stack offset", so the curves
+                               stay clearly separated instead of piling up on
+                               one baseline. One colour per dataset, and the
+                               shapes can still be compared horizontally.
+                               Offset 1.0 = neighbouring curves just touch;
+                               larger separates them further.
+                                 . peaks are MERGED ACROSS SPECTRA: the same
+                                   peak labelled once per spectrum turns into a
+                                   mess, so nearby peaks (within the tolerance)
+                                   are treated as one peak - a single dashed
+                                   line and a single AVERAGED wavenumber.
+                                   The tolerance falls back to "minimum peak
+                                   separation" when left blank, or set it in
+                                   the dialog (command line: --peak-merge 30).
+                                   Each spectrum keeps its own peak markers
+                                   (red dots / blue squares) so you can see
+                                   which spectra contributed.
                                  . the x axis uses the INTERSECTION of every
                                    dataset's wavenumber range, so a shorter
                                    spectrum does not leave a blank strip on the
@@ -475,17 +491,42 @@ All in the [Analysis] menu.
                                  . each curve is normalized to max = 1 by
                                    default; untick it to keep raw intensities
                                    and compare real relative strengths
-                                 . peak annotation is optional; when enabled,
-                                   every peak gets a dashed line down to the
-                                   x axis
                                  . untick "show peak values" to drop the
                                    numbers and keep only the dashed lines and
                                    markers - much clearer with a dozen curves
                                    (the main panel's "Show peak values" does
                                    the same)
                                  . the legend names the source file of each
-                                   curve (first 12 at most)
+                                   curve (first 12 at most) and carries a white
+                                   background so it stays readable on top of
+                                   the curves
+                                 . the dialog opens as a PREVIEW first:
+                                   changing settings or editing peaks only
+                                   redraws the preview - nothing is written to
+                                   the results folder until you press
+                                   "Export PNG"
+                                     - left-click the plot = add a peak there
+                                       (blue dashed line + blue value)
+                                     - right-click a dashed line = remove the
+                                       nearest peak (auto-detected or manual)
+                                     - "Re-detect" = drop every manual edit and
+                                       go back to the auto-detected peaks
+                                     - press Enter or "Refresh preview" to
+                                       redraw after typing a parameter
+                                   Adding or removing peaks requires "Merge
+                                   peaks across spectra (one peak, one line,
+                                   one value)", because only merging gives one
+                                   line and one value per peak
+                                   The command line (--overlay) is batch mode
+                                   with no preview window: it draws the
+                                   auto-detected peaks straight away
                                Exported as 叠加图_N条.png into the results folder.
+
+                               Difference from the waterfall: the waterfall just
+                               offsets the curves to show WHICH peaks are there;
+                               this one also merges and labels the peaks across
+                               spectra, and every curve is coloured and named in
+                               a legend.
   Compare with a reference     compare one spectrum with a single reference
   Pairing with the local library  compare against every spectrum in 参考谱库
 
@@ -565,6 +606,7 @@ Conversion
   jws2csv.py --skip-existing            never overwrite existing CSV
   jws2csv.py --waterfall folder         stacked waterfall chart
   jws2csv.py --overlay folder           overlaid chart, one colour per dataset
+                                        (batch mode, no preview)
 
 Processing (same names as the advanced settings)
   --despike --baseline iterative --order 5 --iters 20
@@ -572,6 +614,7 @@ Processing (same names as the advanced settings)
   --deriv 1 --norm max --calib 520.6:520.7
   --x-min 100 --x-max 2000 --tick 200 --fig-w 1600 --fig-h 900
   --no-peaks --no-peak-dash --no-peak-labels
+  --peak-merge 30 --no-peak-merge --stack-offset 1.0
   --header-custom "Wavenumber,Intensity"
 
 Analysis

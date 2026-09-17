@@ -5,6 +5,7 @@
 * 叠加图：每个数据集必须用不同颜色画出来（调色板颜色逐个命中）；
 * 峰位虚线：关掉再打开，标注色像素必须明显增多（自动峰和手动峰分别验）。
 """
+import math
 import os
 import sys
 
@@ -153,7 +154,7 @@ def main():
     _orig_png = T.render_png
 
     def _capture(_path, _series, _title, _xlabel, _ylabel, plot=None,
-                 width=None, height=None):
+                 width=None, height=None, return_geometry=False):
         caps["plot"] = dict(plot or {})
 
     def _render_overlay(extra_plot=None):
@@ -225,7 +226,172 @@ def main():
     check("删掉自动峰后图上它的标注色像素减少", d_on < d_off,
           "删前=%d 删后=%d" % (d_off, d_on))
 
-    for f in (dst, off, on, m_off_p, m_on_p, lbl, nolbl, h_on, h_off):
+    # ---------- 7) 堆叠排布（stacked spectra）----------
+    syn_x = [float(v) for v in range(300, 1601)]
+
+    def _spec(shift):
+        out = []
+        for x in syn_x:
+            v = 0.02
+            for c in (500.0, 700.0, 1000.0):
+                v += math.exp(-((x - (c + shift)) ** 2) / (2 * 8.0 ** 2))
+            out.append(v)
+        return out
+
+    syn = [("s%d" % i, list(syn_x), _spec(sh)) for i, sh in enumerate((-6.0, 0.0, 6.0))]
+
+    caps.clear()
+    T.render_png = _capture
+    try:
+        T.render_overlay("_unused_.png", syn, "t", "x", "y", {"stack_offset": 1.0})
+    finally:
+        T.render_png = _orig_png
+    got2 = caps.get("plot", {})
+    check("叠加图默认走堆叠排布", got2.get("stacked") is True, str(got2.get("stacked")))
+    check("叠加图默认做峰位跨谱合并",
+          got2.get("merge_peak_labels") is True, str(got2.get("merge_peak_labels")))
+    check("叠加图把偏移传给渲染器", got2.get("stack_offset") == 1.0,
+          str(got2.get("stack_offset")))
+
+    def _centroid(path, colour):
+        im2 = Image.open(path).convert("RGB")
+        p2 = im2.load()
+        tot = 0
+        n = 0
+        for y in range(im2.height):
+            for x in range(im2.width):
+                if p2[x, y] == colour:
+                    tot += y
+                    n += 1
+        return (tot / n) if n else None
+
+    stk = os.path.join(OUT, "_ov_stack.png")
+    T.render_overlay(stk, syn, "stack", T._DEFAULT_X_HEADER, "norm",
+                     {"annotate_peaks": False, "stack_offset": 1.0},
+                     common_range=False)
+    band = [_centroid(stk, tuple(int(T._PALETTE[i].lstrip("#")[k:k + 2], 16)
+                                 for k in (0, 2, 4))) for i in range(len(syn))]
+    check("堆叠后每条谱落在各自的竖直区间（谱线不压在一起）",
+          all(b is not None for b in band)
+          and all(abs(band[i + 1] - band[i]) > 50 for i in range(len(band) - 1)),
+          "各条重心 y = %s" % [None if b is None else round(b) for b in band])
+    check("堆叠是自上而下依次排开的",
+          all(band[i] > band[i + 1] for i in range(len(band) - 1)),
+          str([round(b) for b in band]))
+
+    # ---------- 8) 峰位跨谱合并 ----------
+    po2 = T._plot_opts({"peak_merge_tol": 20.0})
+    cl = T.peak_clusters(syn, po2)
+    check("三组互相靠近的峰各自合并成一个（9 个峰 -> 3 个）", len(cl) == 3,
+          "得 %d 簇：%s" % (len(cl), [round(c["x"], 1) for c in cl]))
+    check("合并后取的是平均波数",
+          all(abs(c["x"] - t) < 3.0 for c, t in zip(cl, (500.0, 700.0, 1000.0))),
+          str([round(c["x"], 2) for c in cl]))
+    check("每一簇都记录了参与的 3 条谱",
+          all(c["n"] == 3 and len(c["curves"]) == 3 for c in cl),
+          str([c["n"] for c in cl]))
+
+    # 容差调到比峰间距还小 -> 不再合并，9 个峰各自成簇
+    cl_fine = T.peak_clusters(syn, T._plot_opts({"peak_merge_tol": 1.0}))
+    check("容差调小后不再合并", len(cl_fine) == 9, "得 %d 簇" % len(cl_fine))
+    # 相邻峰相差 6，容差 20 时不会被“链式”串成一整段
+    check("不会把整段峰链式串成一簇", len(cl) == 3, "%d" % len(cl))
+
+    mg = os.path.join(OUT, "_ov_merge_on.png")
+    nm = os.path.join(OUT, "_ov_merge_off.png")
+    T.render_overlay(mg, syn, "merge", T._DEFAULT_X_HEADER, "norm",
+                     {"annotate_peaks": True, "peak_merge_tol": 20.0,
+                      "stack_offset": 1.0},
+                     common_range=False, merge_peaks=True)
+    T.render_overlay(nm, syn, "nomerge", T._DEFAULT_X_HEADER, "norm",
+                     {"annotate_peaks": True, "peak_merge_tol": 20.0,
+                      "stack_offset": 1.0},
+                     common_range=False, merge_peaks=False)
+
+    def _dash_columns(path, colour, tol=6):
+        """统计图片里有多少个不同的 x 列含标注色 —— 约等于标注的峰个数。"""
+        im2 = Image.open(path).convert("RGB")
+        p2 = im2.load()
+        cols = set()
+        for y in range(im2.height):
+            for x in range(im2.width):
+                r, g, b = p2[x, y]
+                if (abs(r - colour[0]) <= tol and abs(g - colour[1]) <= tol
+                        and abs(b - colour[2]) <= tol):
+                    cols.add(x)
+        return cols
+
+    c_on = len(_dash_columns(mg, AUTO))
+    c_off = len(_dash_columns(nm, AUTO))
+    check("合并后标注的峰明显变少（虚线列数下降）", c_on < c_off,
+          "合并 %d 列 / 不合并 %d 列" % (c_on, c_off))
+    check("不合并时每个峰各标一条", c_off > c_on, "%d vs %d" % (c_off, c_on))
+
+    # ---------- 9) 手动清单标注（交互式预览「确认」后交给渲染器的就是它）----------
+    mko = {"annotate_peaks": True, "peak_merge_tol": 20.0, "stack_offset": 1.0}
+
+    def _ov_mark(path, marks):
+        T.render_overlay(path, syn, "mark", T._DEFAULT_X_HEADER, "norm", dict(mko),
+                         common_range=False, merge_peaks=True, marks=marks)
+
+    # 不给清单（None）= 自动合并，和默认行为一致
+    auto_p = os.path.join(OUT, "_ov_mark_auto.png")
+    _ov_mark(auto_p, None)
+    check("marks=None 时与自动合并的结果一致",
+          _dash_columns(auto_p, AUTO) == _dash_columns(mg, AUTO),
+          "auto 列 %d / 默认 %d" % (len(_dash_columns(auto_p, AUTO)),
+                                    len(_dash_columns(mg, AUTO))))
+
+    # 清单里只留一个手动峰 -> 只画一条虚线（手动色），且不再有自动峰标注
+    mk1 = os.path.join(OUT, "_ov_mark_one.png")
+    _ov_mark(mk1, [{"x": 700.0, "manual": True}])
+    c1 = _dash_columns(mk1, MANUAL)
+    check("清单只剩一个峰位时只标一处（手动色）",
+          bool(c1) and max(c1) - min(c1) < 60,
+          "列 %s~%s" % ((min(c1), max(c1)) if c1 else (None, None)))
+    check("清单以外的自动峰不再标注", not _dash_columns(mk1, AUTO),
+          "自动色列 %d" % len(_dash_columns(mk1, AUTO)))
+
+    # 清单里两个手动峰 -> 两处、彼此分开
+    mk2 = os.path.join(OUT, "_ov_mark_two.png")
+    _ov_mark(mk2, [{"x": 700.0, "manual": True}, {"x": 1000.0, "manual": True}])
+    c2 = _dash_columns(mk2, MANUAL)
+    check("清单里两个峰位画两条分得很开的虚线",
+          bool(c2) and max(c2) - min(c2) > 200,
+          "列 %s~%s" % ((min(c2), max(c2)) if c2 else (None, None)))
+
+    # 清单被清空 -> 图上不再有峰位标注
+    mk0 = os.path.join(OUT, "_ov_mark_zero.png")
+    _ov_mark(mk0, [])
+    check("峰位被全部删掉后图上不再有标注",
+          not _dash_columns(mk0, AUTO) and not _dash_columns(mk0, MANUAL),
+          "auto=%d manual=%d" % (len(_dash_columns(mk0, AUTO)),
+                                 len(_dash_columns(mk0, MANUAL))))
+
+    # ---------- 10) 预览用的绘图区几何 ----------
+    geo_p = os.path.join(OUT, "_ov_geom.png")
+    geo = T.render_overlay(geo_p, syn, "geo", T._DEFAULT_X_HEADER, "norm",
+                           dict(mko), common_range=False, return_geometry=True)
+    need = ("xmin", "xmax", "ml", "pw", "mt", "ph", "width", "height")
+    check("return_geometry 回报了完整的绘图区几何",
+          isinstance(geo, dict) and all(k in geo for k in need), str(sorted(geo or [])))
+    if isinstance(geo, dict) and all(k in geo for k in need):
+        check("几何里的绘图区落在图内",
+              0 < geo["ml"] and geo["ml"] + geo["pw"] <= geo["width"]
+              and 0 < geo["mt"] and geo["mt"] + geo["ph"] <= geo["height"],
+              "ml=%s pw=%s width=%s" % (geo["ml"], geo["pw"], geo["width"]))
+        check("几何里的波数范围是递增的",
+              geo["xmax"] > geo["xmin"],
+              "%.1f ~ %.1f" % (geo["xmin"], geo["xmax"]))
+        # 预览把鼠标 x 换算成波数的公式：xmin + (ix-ml)/pw*(xmax-xmin)
+        mid = geo["xmin"] + (geo["ml"] + geo["pw"] / 2.0 - geo["ml"]) / float(geo["pw"]) \
+            * (geo["xmax"] - geo["xmin"])
+        check("绘图区正中央对应波数范围的中点",
+              abs(mid - (geo["xmin"] + geo["xmax"]) / 2.0) < 1e-6,
+              "%.5f vs %.5f" % (mid, (geo["xmin"] + geo["xmax"]) / 2.0))
+
+    for f in (dst, off, on, m_off_p, m_on_p, lbl, nolbl, h_on, h_off,
+              stk, mg, nm, auto_p, mk1, mk2, mk0, geo_p):
         try:
             os.remove(f)
         except OSError:

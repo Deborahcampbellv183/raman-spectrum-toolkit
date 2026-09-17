@@ -96,6 +96,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -168,7 +169,11 @@ _PLOT_DEFAULT = {
     "manual_peaks": None,
     "hidden_peaks": None,
     "mineral_name": None,
-    "stack_offset": 0.75,
+    "stack_offset": 1.0,
+    "stacked": False,
+    "merge_peak_labels": False,
+    "peak_merge_tol": None,
+    "peak_marks": None,
 }
 
 
@@ -1623,6 +1628,52 @@ def _png_dashed_v(draw, x, y_from, y_to, color, dash=7, gap=5, width=1):
         y = ye + gap
 
 
+def _merge_tol(p):
+    """峰位合并容差：peak_merge_tol 未设时沿用“最小峰间距”。"""
+    tol = p.get("peak_merge_tol")
+    if tol is None:
+        tol = abs(float(p["peak_min_dist"]))
+    return max(1e-9, abs(float(tol)))
+
+
+def peak_clusters(series, plot=None):
+    """把多条谱的峰位并到一起，邻近的归为同一个峰。
+
+    返回按波数升序排列的列表，每项：
+        {"x": 簇内平均波数, "xs": [各成员峰位], "n": 成员数,
+         "curves": 参与的数据集序号集合, "manual": 是否全是手动峰}
+
+    判据：与簇内已有序号的**均值**相差不超过容差就并入，否则另起一簇。
+    用均值而不是“与上一个成员比较”，是为了避免链式漂移把一整段峰串成一簇。
+    容差取 peak_merge_tol，未设时沿用“最小峰间距”。
+    """
+    p = _plot_opts(plot)
+    tol = _merge_tol(p)
+
+    found = []
+    for k, item in enumerate(series):
+        xs, ys = item[1], item[2]
+        if not xs or not ys:
+            continue
+        for pk in analyze_peaks(xs, ys, p, processed=True):
+            found.append((pk["x"], k, bool(pk.get("manual"))))
+    found.sort(key=lambda t: t[0])
+
+    clusters = []
+    for x, k, manual in found:
+        if clusters and abs(x - clusters[-1]["x"]) <= tol:
+            c = clusters[-1]
+            c["xs"].append(x)
+            c["x"] = sum(c["xs"]) / len(c["xs"])
+            c["n"] = len(c["xs"])
+            c["curves"].add(k)
+            c["manual"] = c["manual"] and manual
+        else:
+            clusters.append({"x": x, "xs": [x], "n": 1, "curves": {k},
+                             "manual": manual})
+    return clusters
+
+
 def overlay_color(k):
     """叠加图配色：前 8 条用标准色板，之后按黄金角旋转色相生成新色，保证彼此可区分。"""
     n = len(_PALETTE)
@@ -1639,7 +1690,8 @@ def overlay_color(k):
     return "#%02x%02x%02x" % (int(r2 * 255), int(g2 * 255), int(b2 * 255))
 
 
-def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, height=None):
+def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, height=None,
+               return_geometry=False):
     if not _HAVE_PIL:
         raise JwsError(T("导出 PNG 需要 Pillow 组件（pip install pillow）"))
     series = [s for s in series if s[1] and s[2]]
@@ -1649,6 +1701,13 @@ def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, heigh
     width = int(width or p["fig_width"] or 1600)
     height = int(height or p["fig_height"] or 900)
     series = [(lab, xs, _process_signal(ys, p, xs), col) for lab, xs, ys, col in series]
+    # 堆叠排布：每条按偏移量纵向错开，而不是压在同一基线上（stacked spectra 画法）。
+    # 归一化到最大值 = 1 后再错开，各条互不压线，谱型仍可横向比较。
+    if p["stacked"]:
+        step = max(0.0, float(p["stack_offset"] or 0.0))
+        if step:
+            series = [(lab, xs, [v + k * step for v in ys], col)
+                      for k, (lab, xs, ys, col) in enumerate(series)]
     img = Image.new("RGB", (width, height), (255, 255, 255))
     d = ImageDraw.Draw(img)
     f_title = _png_font(32)
@@ -1730,15 +1789,32 @@ def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, heigh
             d.line(seg, fill=color, width=2, joint="curve")
 
     if p["annotate_peaks"]:
+        # 跨谱合并：同一个峰在每条谱上都标一遍会糊成一片，合并后只画一条虚线、
+        # 只标一个平均波数；此时各条谱自己只保留峰位标记（圆点 / 方块）。
+        merged = bool(p["merge_peak_labels"]) and len(series) > 1
+        marks = []
+        tol = 0.0
+        if merged:
+            tol = _merge_tol(p)
+            raw = p.get("peak_marks")
+            if raw is None:
+                marks = [{"x": c["x"], "manual": c["manual"]}
+                         for c in peak_clusters(series, p)]
+            else:
+                marks = [{"x": float(m["x"]), "manual": bool(m.get("manual"))}
+                         for m in raw]
         for _label, xs, ys, _color in series:
             for k, pk in enumerate(analyze_peaks(xs, ys, p, processed=True)):
                 if not inside(pk["x"], pk["y"]):
+                    continue
+                # 这一簇被用户删掉了，连峰位标记也一起收走，免得留下没有虚线的孤点
+                if merged and not any(abs(pk["x"] - m["x"]) <= tol for m in marks):
                     continue
                 gx = sx(pk["x"])
                 gy = sy(pk["y"])
                 mark_color = (20, 80, 170) if pk.get("manual") else (170, 30, 30)
                 # 峰位波长虚线：从峰顶一直引到横坐标轴（自动峰和手动峰一视同仁）
-                if p["peak_dash_line"]:
+                if p["peak_dash_line"] and not merged:
                     _png_dashed_v(d, gx, gy, mt + ph, mark_color)
                 if pk.get("manual"):
                     d.rectangle([gx - 4, gy - 4, gx + 4, gy + 4], fill=(30, 110, 200))
@@ -1747,8 +1823,22 @@ def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, heigh
                 text = ("%g  %.0f%%" % (round(pk["x"], 1), pk["rel"])
                         if p["peak_label_rel"] else "%g" % round(pk["x"], 1))
                 ly = gy - (12, 32, 52)[k % 3]
-                if p["peak_labels"]:
+                if p["peak_labels"] and not merged:
                     _png_text(d, f_tick, (gx, ly), text, "mb", fill=mark_color)
+
+        if merged:
+            for j, mk in enumerate(marks):
+                gx = sx(mk["x"])
+                if gx < ml - 2 or gx > ml + pw + 2:
+                    continue
+                mark_color = (20, 80, 170) if mk["manual"] else (170, 30, 30)
+                # 标签压在图上缘，靠错位台阶让靠近的峰标签不叠字
+                ty = mt + 6 + (j % 3) * 22
+                if p["peak_dash_line"]:
+                    _png_dashed_v(d, gx, ty + 24, mt + ph, mark_color)
+                if p["peak_labels"]:
+                    _png_text(d, f_tick, (gx, ty), "%g" % round(mk["x"], 1),
+                              "mt", fill=mark_color)
 
     if title and p["show_title"]:
         _png_text(d, f_title, (ml + pw / 2, mt - 55), title, "ma", fill=(30, 30, 30))
@@ -1761,15 +1851,34 @@ def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, heigh
         img.paste(tmp, (12, int(mt + ph / 2 - tmp.height / 2)), tmp)
 
     if len(series) > 1:
-        ly = mt + 12
+        # 峰位标签压在图上缘（三层错位到 mt+72 左右），图例整体下移让开；
+        # 并给图例加一层白底卡片，堆叠图上图例难免压在谱线上，有底色才读得清。
+        ly = mt + (92 if (p["merge_peak_labels"] and len(series) > 1) else 12)
+        rows = []
         for label, _xs, _ys, color in series[:12]:
-            d.line([(ml + pw - 300, ly + 9), (ml + pw - 255, ly + 9)], fill=color, width=4)
-            _png_text(d, f_tick, (ml + pw - 245, ly), label[:28], "la", fill=(40, 40, 40))
+            rows.append((label[:28], color, ly))
             ly += 28
             if ly > mt + ph - 24:
                 break
+        if rows:
+            try:
+                tw = max(d.textlength(t, font=f_tick) for t, _c, _y in rows)
+            except Exception:
+                tw = 200
+            right = ml + pw - 10
+            left = right - tw - 46
+            d.rectangle([left - 6, rows[0][2] - 6, right + 4, rows[-1][2] + 24],
+                        fill=(255, 255, 255))
+            for text, color, yy in rows:
+                d.line([(left, yy + 9), (left + 36, yy + 9)], fill=color, width=4)
+                _png_text(d, f_tick, (left + 44, yy), text, "la", fill=(40, 40, 40))
 
     img.save(path, "PNG")
+    if return_geometry:
+        # 把绘图区的实际位置回报给调用方，交互式预览要靠它把鼠标坐标换算成波数
+        return {"xmin": plot_xmin, "xmax": plot_xmax, "ml": ml, "pw": pw,
+                "mt": mt, "ph": ph, "width": width, "height": height}
+    return None
 
 
 def render_pair_report(path, target_name, target_xy, results, plot=None, tol=5.0,
@@ -2242,30 +2351,37 @@ def render_waterfall(path, series, title="", xlabel="", ylabel="", plot=None, wi
     data = [(lab, xs, ys) for lab, xs, ys in series if len(xs) > 1 and len(ys) > 1]
     if not data:
         raise JwsError(T("没有可绘制的数据"))
-    step = max(0.2, min(float(offset or 0.75), 3.0))
-    stacked = []
-    for k, (lab, xs, ys) in enumerate(data):
-        vals = _norm_max(ys) if normalize else list(ys)
-        base = k * step
-        stacked.append((lab, xs, [v + base for v in vals], _PALETTE[k % len(_PALETTE)]))
+    step = max(0.2, min(float(offset or 1.0), 3.0))
     local = dict(plot or {})
     local.update({"baseline": "none", "smooth_window": 1, "smooth_mode": "mean",
-                  "derivative": 0, "normalize": "none", "despike": False,
-                  "annotate_peaks": False, "show_y_ticks": False,
-                  "y_min": None, "y_max": None})
+                  "derivative": 0, "normalize": "max" if normalize else "none",
+                  "despike": False, "annotate_peaks": False, "show_y_ticks": False,
+                  "y_min": None, "y_max": None,
+                  "stacked": True, "stack_offset": step})
     local.pop("manual_peaks", None)
-    render_png(path, stacked, title, xlabel, ylabel, local, width, height)
+    colored = [(lab, xs, ys, _PALETTE[k % len(_PALETTE)])
+               for k, (lab, xs, ys) in enumerate(data)]
+    render_png(path, colored, title, xlabel, ylabel, local, width, height)
 
 
 def render_overlay(path, series, title="", xlabel="", ylabel="", plot=None,
-                   width=None, height=None, normalize=True, common_range=True):
-    """多数据图叠加：每个数据集一种颜色，全部画在同一套坐标轴上，不做纵向偏移。
+                   width=None, height=None, normalize=True, common_range=True,
+                   merge_peaks=True, marks=None, return_geometry=False):
+    """多数据图叠加（堆叠排布）：每个数据集一种颜色，各条上下错开、谱线彼此分开。
 
-    与瀑布图的区别：瀑布图把各条上下错开，看的是“有哪些峰”；
-    叠加图把各条压在同一基线上比形状，看的是“谱型像不像”。
+    参照 stacked spectra 的画法：各条先归一化到最大值 = 1，再按“谱线偏移”
+    纵向错开 k×偏移，所以不会压在同一条基线上，谱型仍可横向比较。
+
+    峰位标注做了**跨谱合并**：把各条谱上邻近的峰归成同一个峰，只画一条虚线、
+    只标一个平均波数（merge_peaks=False 则退回逐峰标注）。
+    各条谱自己的峰位标记（圆点 / 方块）仍然保留，方便看是哪几条谱有这个峰。
+
+    marks 指定时按这份清单标注（[{"x": 波数, "manual": 是否手动}]），
+    用于交互式预览里用户手动增减峰位；None = 自动合并检测。
 
     common_range=True 时，横坐标取所有数据图波数范围的**交集**：
     只比较大家都有数据的波段，避免某条谱短一截时右边空出一段白。
+    return_geometry=True 时返回绘图区几何，供交互式预览把鼠标坐标换算成波数。
     """
     data = [(lab, xs, ys) for lab, xs, ys in series if len(xs) > 1 and len(ys) > 1]
     if not data:
@@ -2273,6 +2389,11 @@ def render_overlay(path, series, title="", xlabel="", ylabel="", plot=None,
     local = dict(plot or {})
     if normalize:
         local["normalize"] = "max"
+    local["stacked"] = True
+    local.setdefault("stack_offset", 1.0)
+    local["merge_peak_labels"] = bool(merge_peaks) and len(data) > 1
+    if marks is not None:
+        local["peak_marks"] = list(marks)
     if common_range:
         lo, hi = overlay_range(data)
         if lo is not None and hi is not None and hi > lo:
@@ -2282,7 +2403,8 @@ def render_overlay(path, series, title="", xlabel="", ylabel="", plot=None,
             if local.get("x_max") is None:
                 local["x_max"] = hi
     colored = [(lab, xs, ys, overlay_color(k)) for k, (lab, xs, ys) in enumerate(data)]
-    render_png(path, colored, title, xlabel, ylabel, local, width, height)
+    return render_png(path, colored, title, xlabel, ylabel, local, width, height,
+                      return_geometry=return_geometry)
 
 
 def overlay_range(series):
@@ -5558,6 +5680,15 @@ def _cli(args):
             plot["peak_dash_line"] = False
         elif low in ("--no-peak-labels", "--no-peak-numbers"):
             plot["peak_labels"] = False
+        elif low == "--peak-merge":
+            if i + 1 < len(args):
+                try:
+                    plot["peak_merge_tol"] = max(0.001, float(args[i + 1]))
+                except ValueError:
+                    pass
+                i += 1
+        elif low == "--no-peak-merge":
+            plot["merge_peak_labels"] = False
         elif low == "--normalize":
             if i + 1 < len(args):
                 plot["normalize"] = args[i + 1].strip().lower()
@@ -6362,7 +6493,7 @@ def _run_gui():
                 "peak_dash_line": True,
                 "fit_shape": "voigt",
                 "fig_width": 1600, "fig_height": 900,
-                "mineral_name": None, "stack_offset": 0.75,
+                "mineral_name": None, "stack_offset": 1.0,
             }
             self.manual_peaks = {}
             self.hidden_peaks = {}
@@ -7126,7 +7257,8 @@ def _run_gui():
             nvar, ninv = add_combo(proc, "归一化：", "normalize", 10, n_labels, "none")
             add_entry(proc, "峰位归属矿物：", "mineral_name", 11,
                       hint="如 Zircon / 锆石，留空 = 不归属", width=18)
-            add_entry(proc, "瀑布图偏移：", "stack_offset", 12, hint="0.2 ~ 1.5")
+            add_entry(proc, "堆叠偏移（瀑布图 / 叠加图）：", "stack_offset", 12,
+                      hint="0.2 ~ 2.0，1.0 = 谱线刚好不压线")
             avar = tk.BooleanVar(value=bool(adv.get("apply_to_data")))
             ttk.Checkbutton(proc, text="同时应用到导出的数据（CSV/Excel）", variable=avar).grid(
                 row=13, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
@@ -9182,71 +9314,243 @@ def _run_gui():
             self._show_image(dst, T("瀑布图（%d 条）") % len(specs))
 
         def tool_overlay(self):
+            """多数据图叠加：先开交互式预览，用户可手动增减标注峰位，确认后再导出。"""
             specs = self._selected_spectra()
             if len(specs) < 2:
-                messagebox.showinfo("提示", "多数据图叠加需要选中至少 2 条光谱。")
+                messagebox.showinfo(T("提示"), T("多数据图叠加需要选中至少 2 条光谱。"))
+                return
+            try:
+                from PIL import Image as _I
+                from PIL import ImageTk
+            except Exception:
+                messagebox.showerror(T("缺少组件"), T("预览需要 Pillow（pip install pillow）。"))
                 return
             n = len(specs)
-            win = tk.Toplevel(self)
-            win.title("多数据图叠加")
-            win.transient(self)
-            win.resizable(False, False)
-            ttk.Label(win, text="把选中的 %d 条光谱叠画在同一套坐标轴上，每条一种颜色。" % n,
-                      font=("Microsoft YaHei UI", 10, "bold")).grid(
-                row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
-            nvar = tk.BooleanVar(value=True)
-            ttk.Checkbutton(win, text="各条归一化到最大值 = 1（便于比较谱型）",
-                            variable=nvar).grid(row=1, column=0, columnspan=2,
-                                                sticky="w", padx=12, pady=3)
-            avar = tk.BooleanVar(value=bool(self.annotate_peaks.get()))
-            ttk.Checkbutton(win, text="标注峰位（峰位带波长虚线）",
-                            variable=avar).grid(row=2, column=0, columnspan=2,
-                                                sticky="w", padx=12, pady=3)
-            lvar = tk.BooleanVar(value=bool(self.peak_labels.get()))
-            ttk.Checkbutton(win, text="显示峰位数值（取消勾选只留虚线与标记）",
-                            variable=lvar).grid(row=3, column=0, columnspan=2,
-                                                sticky="w", padx=12, pady=3)
-            tvar = tk.BooleanVar(value=bool(self.show_title.get()))
-            ttk.Checkbutton(win, text="标题", variable=tvar).grid(
-                row=4, column=0, columnspan=2, sticky="w", padx=12, pady=3)
-            lo, hi = overlay_range(specs)
-            rng = ""
-            if lo is not None and hi is not None:
-                rng = "（%.1f ~ %.1f cm-1）" % (lo, hi)
-            ttk.Label(win, text="横坐标取各条谱波数范围的交集%s" % rng,
-                      foreground="#777").grid(row=5, column=0, columnspan=2,
-                                              sticky="w", padx=12, pady=(2, 0))
-            if n > 12:
-                ttk.Label(win, text="曲线超过 12 条，图例只列出前 12 条。",
-                          foreground="#8a6d1a").grid(
-                    row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 0))
-            status = tk.StringVar(value="")
-            ttk.Label(win, textvariable=status, foreground="#1a4a8a").grid(
-                row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 8))
+            adv = self.adv_values
+            title_cn = "多数据图叠加（%d 条）" % n
 
-            def run():
+            win = tk.Toplevel(self)
+            win.title(T("多数据图叠加（堆叠排布 · 预览）"))
+            win.transient(self)
+            adv["stack_offset"] = float(adv.get("stack_offset", 1.0) or 1.0)
+
+            # ---- 参数行 ----
+            p1 = ttk.Frame(win)
+            p1.pack(fill="x", padx=12, pady=(10, 2))
+            nvar = tk.BooleanVar(value=True)
+            ttk.Checkbutton(p1, text=T("各条归一化到最大值 = 1"),
+                            variable=nvar).pack(side="left")
+            ttk.Label(p1, text=T("谱线偏移：")).pack(side="left", padx=(10, 0))
+            off_var = tk.StringVar(value=str(adv.get("stack_offset", 1.0)))
+            ttk.Entry(p1, textvariable=off_var, width=6).pack(side="left")
+            ttk.Label(p1, text=T("峰位合并容差(cm-1)：")).pack(side="left", padx=(10, 0))
+            tol_var = tk.StringVar(value="")
+            ttk.Entry(p1, textvariable=tol_var, width=6).pack(side="left")
+            ttk.Label(p1, text=T("(留空 = 最小峰间距)"),
+                      foreground="#888").pack(side="left", padx=4)
+            p2 = ttk.Frame(win)
+            p2.pack(fill="x", padx=12, pady=(0, 4))
+            avar = tk.BooleanVar(value=bool(self.annotate_peaks.get()))
+            ttk.Checkbutton(p2, text=T("标注峰位"), variable=avar).pack(side="left")
+            mvar = tk.BooleanVar(value=True)
+            ttk.Checkbutton(p2, text=T("峰位跨谱合并（一峰一线一值）"), variable=mvar).pack(
+                side="left", padx=(10, 0))
+            lvar = tk.BooleanVar(value=bool(self.peak_labels.get()))
+            ttk.Checkbutton(p2, text=T("显示峰位数值"),
+                            variable=lvar).pack(side="left", padx=(10, 0))
+            tvar = tk.BooleanVar(value=bool(self.show_title.get()))
+            ttk.Checkbutton(p2, text=T("标题"), variable=tvar).pack(side="left", padx=(10, 0))
+            ttk.Button(p2, text=T("刷新预览"),
+                       command=lambda: refresh()).pack(side="left", padx=12)
+
+            # ---- 画布 ----
+            sh = win.winfo_screenheight()
+            max_h = max(300, min(600, sh - 270))
+            cw = tk.Canvas(win, background="#f2f2f2", highlightthickness=1,
+                           highlightbackground="#c9c9c9")
+            cw.pack(padx=12, pady=(2, 4))
+
+            lo, hi = overlay_range(specs)
+            rng = "（%.1f ~ %.1f cm-1）" % (lo, hi) if lo is not None else ""
+            info = tk.StringVar(value=T("横坐标取各条谱波数范围的交集%s") % rng)
+            ttk.Label(win, textvariable=info, foreground="#777").pack(anchor="w", padx=12)
+            tip = tk.StringVar(value="")
+            ttk.Label(win, textvariable=tip, foreground="#1a4a8a").pack(anchor="w", padx=12)
+
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=12, pady=(4, 10))
+            ttk.Button(row, text=T("导出 PNG"), command=lambda: do_export()).pack(side="right")
+            ttk.Button(row, text=T("重新检测"), command=lambda: reset_marks()).pack(
+                side="right", padx=6)
+            ttk.Button(row, text=T("关闭"), command=win.destroy).pack(side="right")
+
+            # ---- 状态 ----
+            state = {"marks": None, "geom": None, "scale": 1.0, "photo": None,
+                     "auto": []}
+            tmp_png = os.path.join(tempfile.gettempdir(), "_raman_overlay_preview.png")
+
+            def plot_opts():
+                op = self.plot_options()
+                op["annotate_peaks"] = bool(avar.get())
+                op["peak_labels"] = bool(lvar.get())
+                op["show_title"] = bool(tvar.get())
+                op["stack_offset"] = _offset()
+                op["peak_merge_tol"] = _tol()
+                return op
+
+            def _offset():
+                try:
+                    v = float(str(off_var.get()).strip() or 1.0)
+                except ValueError:
+                    return float(adv.get("stack_offset", 1.0) or 1.0)
+                return max(0.2, min(v, 3.0))
+
+            def _tol():
+                txt = str(tol_var.get()).strip()
+                if not txt:
+                    return None
+                try:
+                    return max(0.001, float(txt))
+                except ValueError:
+                    return None
+
+            def refresh(note=""):
+                """重新渲染预览。回到没手动改过时，同时记下自动检测的峰位。"""
+                op = plot_opts()
+                if state["marks"] is None or not mvar.get():
+                    state["auto"] = [{"x": c["x"], "manual": c["manual"]}
+                                     for c in peak_clusters(specs, op)]
+                ylab = T("归一化强度") if nvar.get() else T("强度")
+                try:
+                    geom = render_overlay(tmp_png, specs, T(title_cn),
+                                          _DEFAULT_X_HEADER, ylab, op,
+                                          normalize=bool(nvar.get()),
+                                          merge_peaks=bool(mvar.get()),
+                                          marks=state["marks"],
+                                          return_geometry=True)
+                except Exception as exc:
+                    tip.set(T("生成失败：%s") % exc)
+                    return
+                state["geom"] = geom
+                img = _I.open(tmp_png)
+                scale = min(1.0, 1120.0 / img.width, float(max_h) / img.height)
+                if scale < 1.0:
+                    resample = _I.LANCZOS if hasattr(_I, "LANCZOS") else _I.BILINEAR
+                    img = img.resize((max(1, int(img.width * scale)),
+                                      max(1, int(img.height * scale))), resample)
+                state["scale"] = scale
+                state["photo"] = ImageTk.PhotoImage(img)
+                cw.configure(width=img.width, height=img.height)
+                cw.delete("all")
+                cw.create_image(0, 0, anchor="nw", image=state["photo"])
+                show_mark_count(note)
+
+            def marks_now():
+                if not mvar.get():
+                    return []
+                if state["marks"] is None:
+                    return list(state["auto"])
+                return state["marks"]
+
+            def show_mark_count(note=""):
+                cnt = len(marks_now())
+                tip.set(T("当前标注 %d 个峰位。") % cnt
+                        + ("　" + T(note) if note else "")
+                        + ("　" + T("左键点图＝加一个峰位，右键＝删掉最近的一条")
+                           if mvar.get() else "　" + T("未开启跨谱合并，不能手动增减")))
+
+            def _to_data(event):
+                """画布坐标 → 波数。落在绘图区外返回 None。"""
+                g = state["geom"]
+                if not g:
+                    return None
+                ix = event.x / state["scale"]
+                iy = event.y / state["scale"]
+                if not (g["ml"] - 2 <= ix <= g["ml"] + g["pw"] + 2):
+                    return None
+                if not (g["mt"] - 2 <= iy <= g["mt"] + g["ph"] + 2):
+                    return None
+                if g["xmax"] <= g["xmin"]:
+                    return None
+                return g["xmin"] + (ix - g["ml"]) / float(g["pw"]) * (g["xmax"] - g["xmin"])
+
+            def on_left(event):
+                if not mvar.get():
+                    tip.set(T("请先勾选“峰位跨谱合并”，再手动增减峰位。"))
+                    return
+                x = _to_data(event)
+                if x is None:
+                    return
+                if state["marks"] is None:
+                    state["marks"] = list(state["auto"])
+                tol = _merge_tol(plot_opts())
+                for m in state["marks"]:
+                    if abs(m["x"] - x) <= tol:
+                        tip.set(T("附近已有标注（%.1f），没有重复添加。") % m["x"])
+                        return
+                state["marks"].append({"x": x, "manual": True})
+                state["marks"].sort(key=lambda m: m["x"])
+                refresh(T("已手动添加峰位 %.1f。") % x)
+
+            def on_right(event):
+                if not mvar.get():
+                    tip.set(T("请先勾选“峰位跨谱合并”，再手动增减峰位。"))
+                    return
+                x = _to_data(event)
+                if x is None:
+                    return
+                marks = marks_now()
+                if not marks:
+                    tip.set(T("当前没有可删除的标注。"))
+                    return
+                g = state["geom"]
+                # 命中范围按屏幕 20 px 折算成波数，点得准一点
+                lim = (20.0 / max(state["scale"], 1e-6)) / float(g["pw"]) * (
+                    g["xmax"] - g["xmin"])
+                near = min(marks, key=lambda m: abs(m["x"] - x))
+                if abs(near["x"] - x) > lim:
+                    tip.set(T("附近没有标注峰位，请点在虚线上再右键。"))
+                    return
+                if state["marks"] is None:
+                    state["marks"] = list(state["auto"])
+                state["marks"] = [m for m in state["marks"]
+                                  if abs(m["x"] - near["x"]) > 1e-9]
+                refresh(T("已删除峰位标注 %.1f。") % near["x"])
+
+            def reset_marks():
+                state["marks"] = None
+                refresh(T("已恢复为自动检测的峰位。"))
+
+            def do_export():
                 src = self.files[self.listbox.curselection()[0]]
                 out = self._tool_out_dir(src)
                 dst = os.path.join(out, "叠加图_%d条.png" % n)
-                plot = self.plot_options()
-                plot["annotate_peaks"] = bool(avar.get())
-                plot["peak_labels"] = bool(lvar.get())
-                plot["show_title"] = bool(tvar.get())
+                op = plot_opts()
                 ylab = T("归一化强度") if nvar.get() else T("强度")
                 try:
-                    render_overlay(dst, specs, T("多数据图叠加（%d 条）") % n,
-                                   _DEFAULT_X_HEADER, ylab, plot,
-                                   normalize=bool(nvar.get()))
+                    render_overlay(dst, specs, T(title_cn), _DEFAULT_X_HEADER, ylab, op,
+                                   normalize=bool(nvar.get()),
+                                   merge_peaks=bool(mvar.get()),
+                                   marks=state["marks"] if mvar.get() else None)
                 except Exception as exc:
-                    status.set(T("生成失败：%s") % exc)
+                    tip.set(T("生成失败：%s") % exc)
                     return
-                self._log(T("叠加图：%s") % os.path.basename(dst))
-                self._show_image(dst, T("多数据图叠加（%d 条）") % n)
+                adv["stack_offset"] = op["stack_offset"]
+                self._log(T("叠加图：%s（标注 %d 个峰位）")
+                          % (os.path.basename(dst), len(marks_now())))
+                self._show_image(dst, T(title_cn))
 
-            row = ttk.Frame(win)
-            row.grid(row=8, column=0, columnspan=2, sticky="e", padx=12, pady=(0, 12))
-            ttk.Button(row, text="生成并导出", command=run).pack(side="right")
-            ttk.Button(row, text="关闭", command=win.destroy).pack(side="right", padx=6)
+            cw.bind("<Button-1>", on_left)
+            cw.bind("<Button-3>", on_right)
+            # 勾选框即时重绘；两个输入框按回车或点【刷新预览】才重绘，
+            # 免得每敲一个字符就重画一次
+            for v in (nvar, mvar, lvar, tvar):
+                v.trace_add("write", lambda *a: refresh())
+            for e in p1.winfo_children():
+                if e.winfo_class() == "TEntry":
+                    e.bind("<Return>", lambda ev: refresh())
+            win.bind("<Escape>", lambda e: win.destroy())
+            refresh()
 
         def tool_replace(self):
             specs = self._selected_spectra()
@@ -9638,7 +9942,7 @@ def _run_gui():
     app.mainloop()
 
 
-_MANUAL_VERSION = "2.1"
+_MANUAL_VERSION = "2.2"
 _MANUAL_TITLE = "拉曼光谱工具 · 使用说明书"
 _MANUAL_MARKER = "（说明书版本：%s）" % _MANUAL_VERSION
 _MANUAL_MARKER_EN = "(guide version: %s)" % _MANUAL_VERSION
@@ -10058,13 +10362,41 @@ ERR 叠加图 -> %s||ERR overlay -> %s
 多数据图叠加（所选光谱）…||Multi-dataset overlay (selected spectra)…
 多数据图叠加||Multi-dataset overlay
 多数据图叠加需要选中至少 2 条光谱。||The overlay needs at least 2 spectra.
-把选中的 %d 条光谱叠画在同一套坐标轴上，每条一种颜色。||Overlay the %d selected spectra on shared axes, one colour per dataset.
+把选中的 %d 条光谱上下错开排列，每条一种颜色。||Stack the %d selected spectra one above another, one colour per dataset.
 各条归一化到最大值 = 1（便于比较谱型）||Normalize each curve to max = 1 (easier to compare shapes)
-标注峰位（峰位带波长虚线）||Annotate peaks (with wavelength dashed lines)
+谱线偏移：||Stack offset:
+1.0 = 相邻谱线刚好不压线，越大越分开||1.0 = neighbouring curves just touch; larger means more separation
+峰位合并容差(cm-1)：||Peak merging tolerance (cm-1):
+留空 = 用“最小峰间距”；此距离内的峰算同一个||Blank = use "minimum peak separation"; peaks within this distance count as one
+峰位跨谱合并：邻近的峰只画一条虚线、只标一个平均值||Merge peaks across spectra: nearby peaks share one dashed line and one averaged value
+谱线偏移必须是数字。||The stack offset must be a number.
+峰位合并容差必须是数字。||The peak merging tolerance must be a number.
+多数据图叠加（堆叠排布）||Multi-dataset overlay (stacked)
+堆叠偏移（瀑布图 / 叠加图）：||Stack offset (waterfall / overlay):
+0.2 ~ 2.0，1.0 = 谱线刚好不压线||0.2 ~ 2.0; 1.0 = curves just touch
 曲线超过 12 条，图例只列出前 12 条。||More than 12 curves: the legend lists only the first 12.
-生成并导出||Render and export
 生成失败：%s||Render failed: %s
 峰位虚线引到横坐标轴（自动峰 + 手动峰）||Draw a dashed line from each peak down to the x axis (auto + manual peaks)
+多数据图叠加（堆叠排布 · 预览）||Multi-dataset overlay (stacked · preview)
+各条归一化到最大值 = 1||Normalize each curve to max = 1
+峰位跨谱合并（一峰一线一值）||Merge peaks across spectra (one peak, one line, one value)
+刷新预览||Refresh preview
+重新检测||Re-detect
+导出 PNG||Export PNG
+自动检测||Auto-detected
+已手动添加峰位 %.1f。||Manually added peak at %.1f.
+附近已有标注（%.1f），没有重复添加。||There is already a mark at %.1f; nothing else added.
+请先勾选“峰位跨谱合并”，再手动增减峰位。||Tick "Merge peaks across spectra" before adding or removing peaks.
+当前没有可删除的标注。||There is no mark to remove.
+附近没有标注峰位，请点在虚线上再右键。||No mark nearby; right-click right on a dashed line.
+已删除峰位标注 %.1f。||Removed the peak mark at %.1f.
+已恢复为自动检测的峰位。||Restored the auto-detected peaks.
+当前标注 %d 个峰位。||Currently %d peak(s) marked.
+左键点图＝加一个峰位，右键＝删掉最近的一条||Left-click the plot = add a peak; right-click = remove the nearest one
+未开启跨谱合并，不能手动增减||Merging is off, so peaks cannot be added or removed by hand
+叠加图：%s（标注 %d 个峰位）||Overlay: %s (%d peaks marked)
+预览需要 Pillow（pip install pillow）。||The preview needs Pillow (pip install pillow).
+(留空 = 最小峰间距)||(blank = minimum peak separation)
 特征索引：%s -> %d 条||Feature index: %s -> %d entries
 相似度矩阵（%d×%d）→ %s||Similarity matrix (%dx%d) -> %s
 相减完成：A=%s  B=%s（%d 点）→ %s||Subtraction done: A=%s  B=%s (%d points) -> %s
@@ -10581,7 +10913,7 @@ poor · 非定向||poor · unoriented
 滚动最小值||rolling minimum
 滚动最小值 / 滚动球用||for rolling minimum / rolling ball
 滚动球||rolling ball
-瀑布图偏移：||Waterfall offset:
+瀑布图 / 叠加图偏移：||Waterfall / overlay offset:
 特征拉曼峰（cm-1）：||Characteristic Raman peaks (cm-1):
 状态||Status
 现在打开查看吗？\\n（浏览器里可“打印 → 另存为 PDF”）||Open it now?\\n(In a browser you can "Print -> Save as PDF")
@@ -11125,20 +11457,39 @@ _MANUAL_SECTIONS = [
   多条光谱归一化后纵向错开堆叠，便于横向比较谱型（菜单里一键出图，
   命令行加 --waterfall）。
 
-多数据图叠加
+多数据图叠加（堆叠排布）
   菜单【分析工具】→【多数据图叠加（所选光谱）…】，命令行加 --overlay。
-  与瀑布图不同：叠加图不做上下错开，所有数据集压在同一套坐标轴上，
-  每条数据集一种颜色，看的是“谱型像不像”而不是“有哪些峰”。
+  参照 stacked spectra 的画法：各条谱先归一化到最大值 = 1，
+  再按“谱线偏移”纵向错开 k×偏移，所以**谱线彼此分开、不压在一起**，
+  每条一种颜色，谱型仍可横向比较。偏移 1.0 = 相邻谱线刚好不压线，越大越分开。
+    · **峰位跨谱合并**：同一个峰在每条谱上都标一遍会糊成一片。
+      勾选后把各条谱上邻近的峰（相差不超过容差）归成同一个峰，
+      只画一条虚线、只标一个**平均波数**。容差留空时沿用“最小峰间距”，
+      也可以在对话框里单独填（命令行 --peak-merge 30）。
+      各条谱自己的峰位标记（红点 / 蓝方块）仍然保留，
+      方便看出这个峰是哪几条谱贡献的。
     · 横坐标取所有数据图波数范围的**交集** —— 只比大家都有数据的波段，
       某条谱短一截时右边就不会空出一段白。对话框里会写明实际取到的范围。
       若在【高级设置】里手动填过横坐标范围，则以手动的为准。
-    · 默认各条归一化到最大值 = 1，强度差很多也能看清形状；
-      取消勾选则按原始强度叠画，用来看真实的相对强弱。
-    · 可勾选是否标注峰位；勾上时每个峰会画一条虚线引到横坐标轴。
+    · 默认各条归一化到最大值 = 1；取消勾选则按原始强度错开，
+      用来看真实的相对强弱。
     · 可取消勾选“显示峰位数值”，只留虚线和标记 —— 十几条谱叠在一起时，
       数字会糊成一片，关掉更清爽（同样受主界面【显示峰位数值】影响）。
-    · 右侧图例标出每条曲线的来源文件名（最多列 12 条）。
+    · 右侧图例标出每条曲线的来源文件名（最多列 12 条），图例带白底，
+      压在谱线上也读得清。
+    · 打开后先出**预览窗口**：改参数、增减峰位都只重画预览，
+      不点【导出 PNG】就不会往结果目录写文件。
+      - 左键点图 = 在点击处加一个峰位（蓝色虚线 + 蓝色数值）；
+      - 右键点虚线 = 删掉离点击处最近的峰位（自动的和手动的都能删）；
+      - 【重新检测】= 丢掉全部手动改动，回到自动检测的峰位；
+      - 改完参数按回车或点【刷新预览】才重画，免得每敲一个字符就重绘。
+      手动增减要求勾选“峰位跨谱合并（一峰一线一值）”，
+      因为只有合并模式才是“一个峰一条线一个数值”。
+      命令行 --overlay 是批处理，没有预览窗口，直接按自动检测的峰位出图。
   导出为 叠加图_N条.png，存放在分析结果目录。
+
+  与瀑布图的区别：瀑布图只把各条错开看“有哪些峰”；
+  这里额外做了峰位跨谱合并标注，并且每条曲线带颜色、带图例。
 
 光谱比对（参考谱文件）
   选一个参考谱，算相关系数与谱角，快速看像不像。"""),
@@ -11205,7 +11556,7 @@ _MANUAL_SECTIONS = [
   导数（无 / 一阶 / 二阶）
   归一化（无 / 最大值=1 / 最小-最大）
   峰位归属矿物（填 Zircon 之类，留空 = 不归属）
-  瀑布图偏移（0.2~1.5，越大越分散）
+  堆叠偏移（瀑布图 / 叠加图）
   ☐ 同时应用到导出的数据（CSV/Excel）
 
 拉曼位移校准
@@ -11229,13 +11580,14 @@ _MANUAL_SECTIONS = [
   --png / --xlsx / --csv / --peaks / --fit / --jcamp
   某文件夹                      递归转换
   --waterfall 文件夹            瀑布图
-  --overlay 文件夹              多数据图叠加（每条一色）
+  --overlay 文件夹              多数据图叠加（每条一色，批处理不带预览）
   --out 输出目录                指定输出位置
 
 出图参数
   --x-step 200 --x-start 0 --x-min --x-max --y-min --y-max
   --y-ticks --no-grid --no-title --no-peaks --no-peak-dash
   --no-peak-labels --peak-dist 20 --peak-thresh 7 --peak-label-rel
+  --peak-merge 30 --no-peak-merge --stack-offset 1.0
   --fig-width 1600 --fig-height 900 --manual 1007,974
 
 预处理与归属
@@ -11811,10 +12163,26 @@ Pairing (manual / automatic)
                                spectrum, with a linear transition at the edges
   Waterfall                    many spectra stacked with a vertical offset
   Multi-dataset overlay        [Analysis -> Multi-dataset overlay (selected
-                               spectra)...] or --overlay on the command line.
-                               No vertical offset: every dataset is drawn on the
-                               same axes, one colour per dataset, so you compare
-                               spectral shapes rather than peak lists.
+  (stacked)                    spectra)...] or --overlay on the command line.
+                               Drawn the way stacked-spectra figures are: each
+                               curve is normalized to max = 1 and then offset
+                               vertically by k x "stack offset", so the curves
+                               stay clearly separated instead of piling up on
+                               one baseline. One colour per dataset, and the
+                               shapes can still be compared horizontally.
+                               Offset 1.0 = neighbouring curves just touch;
+                               larger separates them further.
+                                 . peaks are MERGED ACROSS SPECTRA: the same
+                                   peak labelled once per spectrum turns into a
+                                   mess, so nearby peaks (within the tolerance)
+                                   are treated as one peak - a single dashed
+                                   line and a single AVERAGED wavenumber.
+                                   The tolerance falls back to "minimum peak
+                                   separation" when left blank, or set it in
+                                   the dialog (command line: --peak-merge 30).
+                                   Each spectrum keeps its own peak markers
+                                   (red dots / blue squares) so you can see
+                                   which spectra contributed.
                                  . the x axis uses the INTERSECTION of every
                                    dataset's wavenumber range, so a shorter
                                    spectrum does not leave a blank strip on the
@@ -11824,17 +12192,42 @@ Pairing (manual / automatic)
                                  . each curve is normalized to max = 1 by
                                    default; untick it to keep raw intensities
                                    and compare real relative strengths
-                                 . peak annotation is optional; when enabled,
-                                   every peak gets a dashed line down to the
-                                   x axis
                                  . untick "show peak values" to drop the
                                    numbers and keep only the dashed lines and
                                    markers - much clearer with a dozen curves
                                    (the main panel's "Show peak values" does
                                    the same)
                                  . the legend names the source file of each
-                                   curve (first 12 at most)
+                                   curve (first 12 at most) and carries a white
+                                   background so it stays readable on top of
+                                   the curves
+                                 . the dialog opens as a PREVIEW first:
+                                   changing settings or editing peaks only
+                                   redraws the preview - nothing is written to
+                                   the results folder until you press
+                                   "Export PNG"
+                                     - left-click the plot = add a peak there
+                                       (blue dashed line + blue value)
+                                     - right-click a dashed line = remove the
+                                       nearest peak (auto-detected or manual)
+                                     - "Re-detect" = drop every manual edit and
+                                       go back to the auto-detected peaks
+                                     - press Enter or "Refresh preview" to
+                                       redraw after typing a parameter
+                                   Adding or removing peaks requires "Merge
+                                   peaks across spectra (one peak, one line,
+                                   one value)", because only merging gives one
+                                   line and one value per peak
+                                   The command line (--overlay) is batch mode
+                                   with no preview window: it draws the
+                                   auto-detected peaks straight away
                                Exported as 叠加图_N条.png into the results folder.
+
+                               Difference from the waterfall: the waterfall just
+                               offsets the curves to show WHICH peaks are there;
+                               this one also merges and labels the peaks across
+                               spectra, and every curve is coloured and named in
+                               a legend.
   Compare with a reference     compare one spectrum with a single reference
   Pairing with the local library  compare against every spectrum in 参考谱库
 
@@ -11898,6 +12291,7 @@ Conversion
   jws2csv.py --skip-existing            never overwrite existing CSV
   jws2csv.py --waterfall folder         stacked waterfall chart
   jws2csv.py --overlay folder           overlaid chart, one colour per dataset
+                                        (batch mode, no preview)
 
 Processing (same names as the advanced settings)
   --despike --baseline iterative --order 5 --iters 20
@@ -11905,6 +12299,7 @@ Processing (same names as the advanced settings)
   --deriv 1 --norm max --calib 520.6:520.7
   --x-min 100 --x-max 2000 --tick 200 --fig-w 1600 --fig-h 900
   --no-peaks --no-peak-dash --no-peak-labels
+  --peak-merge 30 --no-peak-merge --stack-offset 1.0
   --header-custom "Wavenumber,Intensity"
 
 Analysis
