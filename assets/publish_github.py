@@ -32,7 +32,8 @@ API = "https://api.github.com"
 
 DESC = ("Raman Spectrum Toolkit: convert JASCO .jws / CSV / SPC / JCAMP-DX spectra to CSV, "
         "Excel, PNG; detect, delete and fit Raman peaks, assign mineral bands, search ROD / "
-        "RRUFF reference libraries, identify unknown spectra, overlay multiple datasets. "
+        "RRUFF reference libraries, identify unknown spectra one by one or a whole folder in "
+        "batch, pair measured spectra against a reference set, overlay multiple datasets. "
         "Bilingual EN/ZH Windows desktop tool. 拉曼光谱工具：转换 · 分析 · 矿物鉴定")
 
 TOPICS = ["raman-spectroscopy", "raman", "spectroscopy", "spectrum-converter", "jasco",
@@ -51,7 +52,7 @@ FILES = [
     "tests/test_i18n_kernel.py", "tests/test_ui_english.py",
     "tests/test_output_english.py", "tests/test_cli_english.py",
     "tests/test_dialog_layout.py", "tests/test_overlay_dash.py",
-    "tests/test_overlay_preview.py",
+    "tests/test_overlay_preview.py", "tests/test_batch_pair_identify.py",
 ]
 
 TOK = None
@@ -182,7 +183,7 @@ def main():
     _st, tree = call("POST", "%s/repos/%s/%s/git/trees" % (API, OWNER, REPO),
                      {"tree": blobs})
     _st, commit = call("POST", "%s/repos/%s/%s/git/commits" % (API, OWNER, REPO),
-                       {"message": "%s 叠加图先预览再导出：可手动增减标注峰位" % tag,
+                       {"message": "%s 批量配对 / 批量鉴定：一个文件夹逐条给最佳候选与辅助指标" % tag,
                         "tree": tree["sha"],
                         "parents": ([parent] if parent else []),
                         "author": {"name": login, "email": email},
@@ -240,40 +241,46 @@ JASCO `.jws` 光谱转换 · 拉曼峰分析 · 矿物鉴定（中英双语，Wi
 免安装、不写注册表，所有数据都写在解压目录的 `工具数据/` 里。
 
 ### 本次新增
-- **叠加图改成「先预览、确认后再导出」**（菜单【分析工具 → 多数据图叠加（所选光谱）…】）。
-  打开的是**预览窗口**，改参数、增减峰位都只重画预览，
-  **不点【导出 PNG】就不会往结果目录写任何文件**。
-  - **左键点图 = 在点击处加一个峰位**（蓝色虚线 + 蓝色数值）
-  - **右键点虚线 = 删掉离点击处最近的峰位**（自动检测的、手动加的都能删）
-  - 【重新检测】丢掉全部手动改动，回到自动检测的峰位
-  - 参数改完按回车或点【刷新预览】才重画，免得每敲一个字符就重绘一次
-  - 预览图按屏幕高度自适应缩放，窗口不会超出屏幕
-  命令行 `--overlay` 仍是批处理，没有预览窗口，直接按自动检测的峰位出图。
-- **叠加图按 stacked spectra 排布**：各条先归一化到最大值 = 1，再按“谱线偏移”
-  纵向错开 k×偏移，**谱线彼此分开、不压在一起**（偏移 1.0 = 刚好不压线），
-  每条一种颜色并带图例。前 8 条用标准色板，超过 8 条按黄金角旋转色相生成新色。
-- **峰位跨谱合并**：同一个峰在各条谱上只画一条虚线、只标一个**平均波数**
-  （容差可调，留空沿用“最小峰间距”，命令行 `--peak-merge 30`）。
-- **峰位波长虚线**：自动识别的峰与手动补标的峰，都从峰顶画虚线引到横坐标轴，
-  波数一眼可读（`--no-peak-dash` 可关掉）。
-- **横坐标取各条谱波数范围的交集**，某条短一截时右边不再空出一段白。
-- **可以删除自动标注的峰**：右键对准某个峰即可删掉离鼠标最近的那个峰；
-  自动峰记进该文件的“已删除”名单，出图、峰列表与所有导出都按删除后的结果计算，
-  点【恢复自动峰】一次全恢复。为避免误删，要求点在峰附近（横向约 ±1/40 图宽）。
-- **显示峰位数值开关**：主界面【图表设置】里可关掉峰位数字，命令行 `--no-peak-labels`。
+- **批量配对**：一次拿一整个文件夹的实测谱去配一组参考谱，专门用来找
+  “对不上的那几条”。
+  - 菜单【分析工具 → 配对比较（手动 / 自动）→ 批量配对（文件夹 × 参考谱）…】
+  - 命令行 `--pair-batch 文件夹 [--pair-ref 参考谱文件夹]`
+  - 实测谱取一个文件夹（留空则用主界面左侧选中的光谱）；参考谱取本地参考谱库，
+    或自己指定的文件夹 / 文件
+  - 汇总表**按综合分升序排：对不上的排在最前面**，一眼看到可疑的
+  - 典型用法：一批锆石 × 锆石标准谱，综合分低的就是“可能混了别的晶”的
+- **批量鉴定**：一堆不认识的谱，逐条在全库里找最像的矿物。
+  - 菜单【分析工具 → 批量鉴定（文件夹逐条鉴定）…】
+  - 命令行 `--identify-batch 文件夹 [--identify-top 5]`
+  - 每条给出最佳候选、综合分、F1 与结论文本
+- **汇总表只给辅助数据，不替你下结论**：
+  - 综合分（= 0.5×F1 + 0.5×强峰命中率，与「未知谱鉴定」**同一口径**，
+    所以两处数字对得上）、F1、强峰命中、命中 / 实测 / 参考峰数、平均偏差、
+    相关系数、谱角、偶然概率、领先第二名（分）
+  - 「参考判读」一列只按分数给提示（匹配良好 / 部分匹配 / 匹配很差），
+    **最终是哪个物相由你自己核对峰位与谱型来判**
+  - 表里某行可疑，可以再单独对它跑一次配对，看峰位对照表差在哪几个峰
+- **输出**：汇总表 `CSV`（一条谱一行）+ 汇总报告 `HTML`（浏览器可直接打印为 PDF），
+  都放在“工具数据/分析结果”。
+- 顺带回顾上一版：叠加图已改成「先预览、左键加峰 / 右键删峰、确认后再导出」，
+  并按 stacked spectra 排布 + 峰位跨谱合并（一个峰只画一条虚线、只标一个平均值）。
 
 ### 修复
-- **高级设置窗口超出屏幕**：小屏 / 高 DPI 下原窗口会把底部
-  「确定 / 应用 / 取消」顶到屏幕外、点不到。现在内容改为可滚动、
-  按钮固定在底部，窗口高度不超过屏幕可用高度。
-- 命令行瀑布图纵轴标签在英文模式下未翻译。
-- 手动峰 / 已删自动峰的记账键原先混用相对路径与绝对路径，同一文件可能对不上。
+- 鉴定结论里“仅领先第二名”偶尔显示**负数**（精算后排序键换成 F1，
+  第 2 名的综合分可能反而更高）——现在夹到 0，不再出现“仅领先 -14 分”。
+- 配对与鉴定统一到同一套打分口径，不再出现“配对报告里的 F1”与
+  “鉴定里的综合分”各说各话。
 
 ### 画质与稳定性
-- 七套自测合计 **161 项全部通过**，其中新增的 `tests/test_overlay_preview.py`
-  在真实 Tk 窗口里走一遍左键加峰 / 右键删峰 / 重新检测 / 确认后导出，
-  并断言“还没点导出时输出目录必须是空的”。
-- 中英两份说明书（`使用说明.txt` / `User_Guide.txt`）同步更新至 2.2。
+- 八套自测合计 **201 项全部通过**，其中新增的 `tests/test_batch_pair_identify.py`
+  （40 项）覆盖：自配满分、异类低分、可疑的排最前、汇总表列数对齐、
+  CSV / HTML 落盘、英文模式无中文残留，并在真实 Tk 窗口里跑了一遍批量，
+  检查结果进表、且英文模式下控件文案全是英文。
+- 中英两份说明书（`使用说明.txt` / `User_Guide.txt`）同步更新至 2.3。
+
+### 已知口径（不是 bug）
+- 只识别到 **1 个峰**的谱，F1 一律记 0（命中 < 2 不算识别），综合分因此封顶 50、
+  会一直停在「部分匹配」档。这是刻意的：单个峰不足以定案，宁可让人工去看。
 
 ### 数据说明
 参考谱与数据包来自 RRUFF 项目与 Raman Open Database，请遵守其使用条款；

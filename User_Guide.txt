@@ -1,6 +1,6 @@
 ﻿Raman Spectrum Toolkit  User Guide
 (JASCO .jws conversion - Raman peak analysis - mineral identification)
-(guide version: 2.2)
+(guide version: 2.3)
 ============================================================
 
 In one sentence:
@@ -446,6 +446,52 @@ Pairing (manual / automatic)
   a ranking CSV plus a pairing report PNG that shows the overlaid curves, the
   matched peaks, the ranking table and the peak comparison table.
 
+  Batch pairing (a whole folder x reference set)
+    [Analysis -> Pairing (manual / auto) -> Batch pairing (folder x reference
+    spectra)...], or --pair-batch FOLDER [--pair-ref REF_FOLDER].
+    The pairing entries above handle ONE spectrum at a time; this is the batch
+    wrapper around them:
+      . measured spectra: point at a folder (leave blank to use the spectra
+        selected in the main window);
+      . references: the local reference library, or a folder / file you pick;
+      . every spectrum is scored against the reference set and summarised as
+        one row per measured spectrum.
+    Typical use: a batch of zircons scored against zircon references - the rows
+    with a low score are the ones that may contain another crystal, and they are
+    listed first.
+
+  Batch identification (identify a whole folder)
+    [Analysis -> Batch identification (identify a whole folder)...], or
+    --identify-batch FOLDER --identify-top 5.
+    For a pile of spectra you do not recognise: each one is searched against the
+    whole library and the table lists the best candidate, the score, F1 and the
+    conclusion text.
+    Needs a feature index first (build it in the "Unknown spectrum search"
+    window, or with --identify-index).
+
+  What the summary table contains
+    . score = 0.5 x F1 + 0.5 x strong-peak hit rate (the same scoring as
+      "Unknown spectrum search");
+    . F1, strong-peak hits, matched / measured / reference peak counts, mean
+      deviation, correlation, spectral angle, chance probability and the lead
+      over the runner-up (meaningful only when the reference set has more than
+      one entry);
+    . the "Advisory reading" column is only a hint derived from the score
+      (good match / partial match / poor match). It does NOT decide for you:
+      check the peaks and the profile yourself before calling the phase.
+    Output (into 工具数据/分析结果):
+      summary CSV (one row per spectrum, ascending score, most doubtful first)
+      summary report HTML (same table, printable to PDF from a browser)
+    Tip: for a low-scoring row, run the single-spectrum [Auto pairing] on it to
+         get the peak comparison table and the report image, and see which peaks
+         disagree.
+
+    Two notes on the scoring:
+    . a spectrum with only ONE detected peak always scores F1 = 0 (fewer than
+      two matches does not count), so its score caps at 50 and it stays in the
+      "partial match" band - on purpose, since one peak cannot settle anything;
+    . --pair-batch / --identify-batch are batch-only; they open no window.
+
 ============================================================
 12. Spectrum arithmetic
 ============================================================
@@ -626,6 +672,8 @@ Analysis
   --cluster [FILE|FOLDER] [--cluster-cut 0.2]    clustering + PCA
   --map 5,5 [--map-metric main_peak|intensity|fwhm|peaks|total|at:1000]
   --pair FILE                                    auto-pair against the local library
+  --pair-batch FOLDER [--pair-ref REF_FOLDER]    batch pairing (one row per spectrum)
+  --identify-batch FOLDER [--identify-top 5]     batch identification (best candidate each)
   --compare FILE --ref FILE                      compare with one reference
   --average FILES / --subtract A B / --waterfall FILES
   --report FILES                                 HTML report

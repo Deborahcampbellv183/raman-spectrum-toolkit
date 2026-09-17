@@ -45,6 +45,11 @@
     --report [文件夹] [--out 目录]      生成自包含 HTML 分析报告（峰表 + 图 + 参数）
     --batch 文件夹 [--out 目录]         整目录批处理（转换 + 峰表 + 出图 + 汇总统计）
     --pair 文件                        与本地参考谱库自动配对（峰位匹配 F1 排序）
+    --pair-batch 文件夹 [--pair-ref 目录] 批量配对：多条实测谱逐条配参考谱集，
+                                       汇总表按综合分升序（最可疑的在前），
+                                       并给 CSV + HTML 报告
+    --identify-batch 文件夹            批量鉴定：多条陌生谱逐条全库检索，
+                                       汇总表给最佳候选 + 综合分 + 结论文本
     --db-match 文件                    与本地参考谱库比对（相关系数 / 谱角）
 
 数据库与矿物信息：
@@ -4873,8 +4878,10 @@ def identify_unknown(target_xy, plot=None, keys=None, kinds=None, must="", not_=
     result = pool[:max(1, int(top))]
     named = [r for r in result if r.get("named", True)]
     best = named[0] if named else None
-    margin = ((best["score"] - named[1]["score"]) if (best and len(named) > 1)
-              else (best["score"] if best else 0.0))
+    # 精算后排序键换成 exact_f1，第 2 名的综合分有可能反而更高，
+    # 相减会出现负数；文案里写成“仅领先 -14 分”很别扭，这里夹到 0。
+    margin = max(0.0, (best["score"] - named[1]["score"]) if (best and len(named) > 1)
+                 else (best["score"] if best else 0.0))
     unnamed_top = next((r for r in result if not r.get("named", True)), None)
     if unnamed_top is None:
         extra = next((r for r in pool if not r.get("named", True)), None)
@@ -4983,6 +4990,284 @@ def write_identify_csv(dst, target_name, results, verdict="", total=0):
         for row in format_identify_rows(results):
             f.write(",".join(c.replace(",", " ") for c in row) + "\n")
     return dst
+
+
+# ---------------------------------------------------------------------------
+# 批量配对 / 批量鉴定
+#
+# 单个谱的「配对」与「鉴定」各自都只处理一条谱，这里加上外层批量循环：
+#   · batch_pair     多条实测谱 × 一组参考谱（如一批锆石标准谱），逐条给最佳参考；
+#   · batch_identify 多条陌生谱，逐条在全库里找最像的矿物。
+# 两者共用 score_peaks_vs_ref 这一份打分口径，所以汇总表里的数字互相对得上。
+# 汇总表只列「辅助指标」，最终是哪个物相由使用者自己判断。
+# ---------------------------------------------------------------------------
+
+def _target_peak_list(target_xy, plot=None):
+    """目标谱的峰位表 [(峰位, 相对强度)]；没有识别到峰则返回空表。"""
+    xs, ys = target_xy
+    return [(pk["x"], pk["rel"]) for pk in analyze_peaks(xs, ys, plot)]
+
+
+def score_peaks_vs_ref(tlist, target_xy, ref_xy, plot=None, tol=IDENTIFY_TOL):
+    """目标峰的峰位表 vs 一条参考谱：综合分 / F1 / 强峰命中 / 相关系数 / 谱角。
+
+    口径与「未知谱鉴定」完全一致（score_peak_sets），
+    免得配对报告和鉴定结果两处给出不同的数字。
+    """
+    rpeaks = analyze_peaks(ref_xy[0], ref_xy[1], plot)
+    if not tlist or not rpeaks:
+        return None
+    sc = score_peak_sets(tlist, [p["x"] for p in rpeaks],
+                         [p["rel"] for p in rpeaks], tol)
+    cmp = compare_spectra(target_xy, ref_xy)
+    sc["corr"] = cmp["corr"] if cmp else None
+    sc["angle"] = cmp["angle"] if cmp else None
+    return sc
+
+
+def load_reference_set(paths):
+    """把参考谱文件 / 文件夹读成 [(名称, xs, ys)]。"""
+    refs = []
+    for path in find_input_files(paths):
+        if not path.lower().endswith((".csv", ".txt", ".dat")):
+            continue
+        try:
+            refs.append(load_reference_spectrum(path))
+        except Exception:
+            continue
+    return refs
+
+
+def pair_reading(best):
+    """配对结果的「参考判读」。只是提示，最终判断留给人。"""
+    if not best:
+        return T("没有可比对的参考谱")
+    if best["score"] >= 60 and best["strong_hit"] >= 2:
+        return T("匹配良好，可作同一物相（参考判读）")
+    if best["score"] >= 35:
+        return T("部分匹配，建议核对峰位对照（参考判读）")
+    return T("匹配很差，很可能不是同一物相（参考判读）")
+
+
+def batch_pair(target_spectra, refs, plot=None, tol=IDENTIFY_TOL, progress=None):
+    """多条实测谱 × 一组参考谱：逐条给出最佳参考与全部辅助指标。
+
+    target_spectra: [(名称, xs, ys)] 实测谱；
+    refs:           [(名称, xs, ys)] 参考谱（load_reference_set 读入）。
+    返回 [{name, n_points, n_peaks, best, margin, candidates, error}]，
+    candidates 按（综合分, F1）降序。
+    """
+    rows = []
+    total = len(target_spectra)
+    for i, (name, xs, ys) in enumerate(target_spectra):
+        if progress is not None:
+            progress(i, total, name)
+        row = {"name": name, "n_points": len(xs), "n_peaks": 0,
+               "best": None, "margin": None, "candidates": [], "error": ""}
+        try:
+            tlist = _target_peak_list((xs, ys), plot)
+            row["n_peaks"] = len(tlist)
+            if not tlist:
+                row["error"] = T("这条光谱没有识别到峰")
+                rows.append(row)
+                continue
+            cands = []
+            for rname, rxs, rys in refs:
+                sc = score_peaks_vs_ref(tlist, (xs, ys), (rxs, rys), plot, tol)
+                if sc is None:
+                    continue
+                item = dict(sc)
+                item["name"] = rname
+                cands.append(item)
+            if not cands:
+                row["error"] = T("与参考谱没有可比对的峰（波数区间不重叠或参考谱没有峰）")
+                rows.append(row)
+                continue
+            cands.sort(key=lambda r: (-r["score"], -r["f1"], -(r["corr"] or -9.0)))
+            row["candidates"] = cands
+            row["best"] = cands[0]
+            if len(cands) > 1:
+                row["margin"] = cands[0]["score"] - cands[1]["score"]
+        except Exception as exc:
+            row["error"] = str(exc)
+        rows.append(row)
+    if progress is not None:
+        progress(total, total, "")
+    return rows
+
+
+def batch_identify(target_spectra, plot=None, keys=None, kinds=None, must="", not_="",
+                   top=5, progress=None):
+    """多条未知谱逐条鉴定：每条在全库里找最像的矿物。
+
+    返回 [{name, n_points, n_peaks, candidates, verdict, total}]，
+    每条独立调用 identify_unknown，互不影响。
+    """
+    rows = []
+    total = len(target_spectra)
+    for i, (name, xs, ys) in enumerate(target_spectra):
+        if progress is not None:
+            progress(i, total, name)
+        row = {"name": name, "n_points": len(xs), "n_peaks": 0,
+               "candidates": [], "verdict": "", "total": 0}
+        try:
+            row["n_peaks"] = len(_target_peak_list((xs, ys), plot))
+            cands, n_total, verdict = identify_unknown(
+                (xs, ys), plot, keys=keys, kinds=kinds, must=must, not_=not_,
+                top=max(1, int(top)))
+            row["candidates"] = cands
+            row["total"] = n_total
+            row["verdict"] = verdict
+        except Exception as exc:
+            row["verdict"] = str(exc)
+        rows.append(row)
+    if progress is not None:
+        progress(total, total, "")
+    return rows
+
+
+def _best_named(cands):
+    """候选里最靠前的「有矿物名」的一条（未命名样品不参与定名）。"""
+    for c in cands or []:
+        if c.get("named", True):
+            return c
+    return cands[0] if cands else None
+
+
+BATCH_PAIR_COLUMNS = (
+    "文件名", "数据点数", "识别峰数", "最佳参考谱", "综合分", "F1(%)",
+    "强峰命中", "强峰总数", "命中峰数", "实测峰数", "参考峰数",
+    "平均偏差(cm-1)", "偶然概率", "相关系数", "谱角(度)", "领先第二名(分)", "参考判读")
+
+BATCH_IDENTIFY_COLUMNS = (
+    "文件名", "数据点数", "识别峰数", "最佳候选", "RRUFF编号", "类型", "波长(nm)",
+    "综合分", "F1(%)", "强峰命中", "强峰总数", "命中峰数", "参考峰数",
+    "平均偏差(cm-1)", "相关系数", "库内同名谱数", "偶然概率", "参考判读")
+
+
+def batch_pair_row(row):
+    """一条实测谱 → 汇总表的一行。"""
+    best = row.get("best")
+    if not best:
+        out = [row["name"], str(row["n_points"]), str(row["n_peaks"])] + ["-"] * 13
+        out.append(row.get("error") or T("没有可比对的参考谱"))
+        return out
+    margin = row.get("margin")
+    return [
+        row["name"], str(row["n_points"]), str(row["n_peaks"]),
+        best["name"], "%.1f" % best["score"], "%.1f" % best["f1"],
+        str(best["strong_hit"]), str(best["strong_n"]),
+        str(best["matched"]), str(best["n_target"]), str(best["n_ref"]),
+        "%.2f" % best["dev"], "%.3f" % best["pvalue"],
+        "-" if best["corr"] is None else "%.4f" % best["corr"],
+        "-" if best["angle"] is None else "%.2f" % best["angle"],
+        "-" if margin is None else "%+.1f" % margin,
+        pair_reading(best),
+    ]
+
+
+def batch_identify_row(row):
+    """一条陌生谱 → 汇总表的一行（只取最佳候选，判读用鉴定那套结论）。"""
+    best = _best_named(row.get("candidates"))
+    if not best:
+        out = [row["name"], str(row["n_points"]), str(row.get("n_peaks", 0))] + ["-"] * 14
+        out.append(row.get("verdict") or T("没有找到候选"))
+        return out
+    f1 = best["exact_f1"] if best.get("exact_f1") is not None else best["f1"]
+    return [
+        row["name"], str(row["n_points"]), str(row.get("n_peaks", 0)),
+        best["name"], best["rruffid"], T(best["kind"]), best["wavelength"] or "-",
+        "%.1f" % best["score"], "%.1f" % f1,
+        str(best["strong_hit"]), str(best["strong_n"]),
+        str(best["matched"]), str(best["n_ref"]),
+        "%.2f" % best["dev"],
+        "-" if best["corr"] is None else "%.4f" % best["corr"],
+        str(best.get("variants", 1)), "%.3f" % best.get("pvalue", 1.0),
+        row.get("verdict", ""),
+    ]
+
+
+def _pair_sort_key(row):
+    """综合分升序：对不上的排最前，一眼就能看到可疑的。"""
+    best = row.get("best")
+    if not best:
+        return (0, 0.0, row["name"])
+    return (1, best["score"], row["name"])
+
+
+def _identify_sort_key(row):
+    best = _best_named(row.get("candidates"))
+    if not best:
+        return (0, 0.0, row["name"])
+    return (1, best["score"], row["name"])
+
+
+_BATCH_SCORE_NOTE = ("综合分 = 0.5×F1 + 0.5×强峰命中率（与「未知谱鉴定」同一口径）；"
+                     "这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。")
+
+
+def write_batch_pair_csv(dst, rows, ref_label="", tol=IDENTIFY_TOL):
+    """批量配对汇总 CSV：一条实测谱一行。"""
+    with open(dst, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(T("== 批量配对汇总 ==\n"))
+        f.write(T("参考谱集：%s\n") % ref_label)
+        f.write(T("实测谱：%d 条；峰位匹配容差 %.0f cm-1\n") % (len(rows), tol))
+        f.write(T(_BATCH_SCORE_NOTE) + "\n")
+        f.write(T("（按综合分升序排列：最可疑的排在最前面）\n"))
+        f.write(",".join(T(c) for c in BATCH_PAIR_COLUMNS) + "\n")
+        for row in sorted(rows, key=_pair_sort_key):
+            f.write(",".join(c.replace(",", " ") for c in batch_pair_row(row)) + "\n")
+    return dst
+
+
+def write_batch_identify_csv(dst, rows, total_entries=0, top=1):
+    """批量鉴定汇总 CSV：一条陌生谱一行（最佳候选）。"""
+    with open(dst, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(T("== 批量未知谱鉴定汇总 ==\n"))
+        f.write(T("参与检索条目数：%d\n") % total_entries)
+        f.write(T("实测谱：%d 条\n") % len(rows))
+        f.write((T("评分说明：综合分 = 0.5×F1 + 0.5×强峰命中率；")
+                 + T("F1 为峰位匹配 F1（容差 %.0f cm-1，命中<2 记 0）。")
+                 + T("这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。\n"))
+                % IDENTIFY_TOL)
+        f.write(T("（按最佳候选的综合分升序排列：最可疑的排在最前面）\n"))
+        f.write(",".join(T(c) for c in BATCH_IDENTIFY_COLUMNS) + "\n")
+        for row in sorted(rows, key=_identify_sort_key):
+            f.write(",".join(c.replace(",", " ") for c in batch_identify_row(row)) + "\n")
+    return dst
+
+
+def write_batch_pair_html(dst, rows, ref_label="", tol=IDENTIFY_TOL):
+    """批量配对汇总的可打印 HTML 报告。"""
+    ordered = sorted(rows, key=_pair_sort_key)
+    table = [list(BATCH_PAIR_COLUMNS)] + [batch_pair_row(r) for r in ordered]
+    return write_report_html(
+        dst,
+        T("批量配对汇总"),
+        T("参考谱集：%s") % ref_label,
+        info=[(T("实测谱"), str(len(rows))),
+              (T("峰位匹配容差"), "%.0f cm-1" % tol),
+              (T("排序"), T("按综合分升序（最可疑的在前）"))],
+        tables=[(T("逐条配对结果"), table)],
+        notes=[T(_BATCH_SCORE_NOTE),
+               T("要对某条谱细看峰位对照，可单独对它跑一次配对，"
+                 "会生成 _配对报告.csv 与 _配对报告.png。")])
+
+
+def write_batch_identify_html(dst, rows, total_entries=0):
+    """批量鉴定汇总的可打印 HTML 报告。"""
+    ordered = sorted(rows, key=_identify_sort_key)
+    table = [list(BATCH_IDENTIFY_COLUMNS)] + [batch_identify_row(r) for r in ordered]
+    return write_report_html(
+        dst,
+        T("批量未知谱鉴定汇总"),
+        T("参与检索条目数：%d") % total_entries,
+        info=[(T("实测谱"), str(len(rows))),
+              (T("排序"), T("按最佳候选综合分升序（最可疑的在前）"))],
+        tables=[(T("逐条鉴定结果"), table)],
+        notes=[T("评分说明：综合分 = 0.5×F1 + 0.5×强峰命中率；"
+                 "F1 为峰位匹配 F1（容差 %.0f cm-1，命中<2 记 0）。") % IDENTIFY_TOL,
+               T("这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。")])
 
 
 def convert_file(src, out_dir=None, x_header=_DEFAULT_X_HEADER,
@@ -5483,6 +5768,8 @@ def _print_usage():
             "    jws2csv.py 文件/文件夹 [--xlsx --png --csv --peaks]    批量转换",
             "    jws2csv.py --identify 文件           未知光谱全库鉴定",
             "    jws2csv.py --pair 文件               与本地库自动配对",
+            "    jws2csv.py --pair-batch 文件夹       批量配对（找对不上的）",
+            "    jws2csv.py --identify-batch 文件夹   批量鉴定（逐条给最佳候选）",
             "    jws2csv.py --rruff-list              查看 RRUFF 数据包",
             "    jws2csv.py --mineral-search 名称     查内置矿物特征峰表",
             "    jws2csv.py --manual [路径]           打印 / 导出说明书",
@@ -5512,6 +5799,8 @@ def _cli(args):
     db_ids = None
     db_target = None
     pair_target = None
+    pair_batch_arg = None
+    pair_ref_arg = None
     db_ls = False
     rruff_list = False
     rruff_get = None
@@ -5533,6 +5822,7 @@ def _cli(args):
     mineral_mode = "name"
     manual_arg = None
     identify_arg = None
+    identify_batch_arg = None
     identify_top = 15
     identify_must = ""
     identify_not = ""
@@ -5628,6 +5918,10 @@ def _cli(args):
         elif low in ("--identify", "--search-unknown", "--鉴定"):
             if i + 1 < len(args) and not args[i + 1].startswith("-"):
                 identify_arg = args[i + 1]
+                i += 1
+        elif low == "--identify-batch":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                identify_batch_arg = args[i + 1]
                 i += 1
         elif low == "--identify-top":
             if i + 1 < len(args):
@@ -5740,6 +6034,14 @@ def _cli(args):
         elif low == "--pair":
             if i + 1 < len(args):
                 pair_target = args[i + 1]
+                i += 1
+        elif low == "--pair-batch":
+            if i + 1 < len(args):
+                pair_batch_arg = args[i + 1]
+                i += 1
+        elif low == "--pair-ref":
+            if i + 1 < len(args):
+                pair_ref_arg = args[i + 1]
                 i += 1
         elif low == "--db-ls":
             db_ls = True
@@ -5926,6 +6228,65 @@ def _cli(args):
         print(T("报告已保存：%s") % dst)
         return 0
 
+    if pair_batch_arg is not None:
+        if pair_ref_arg:
+            ref_paths = find_input_files([pair_ref_arg])
+            ref_label = os.path.basename(os.path.abspath(pair_ref_arg))
+        else:
+            ref_paths = db_list()
+            ref_label = T("本地参考谱库")
+        if not ref_paths:
+            print(T("没有找到参考谱：用 --pair-ref 指定参考谱文件或文件夹，"))
+            print(T("或先用 --db-get 把参考谱下载到本地库。"))
+            return 1
+        refs = load_reference_set(ref_paths)
+        if not refs:
+            print(T("参考谱一条也读不出来（需要两列文本 / CSV）：%s") % ref_label)
+            return 1
+        files = [p for p in find_input_files([pair_batch_arg])
+                 if not any(os.path.basename(p).lower().endswith(sfx)
+                            for sfx in _SKIP_FILE_SUFFIXES)]
+        spectra = collect_spectra(files, plot, verbose=True)
+        if not spectra:
+            print(T("没有读到待配对的实测谱：%s") % pair_batch_arg)
+            return 1
+        print(T("批量配对：%d 条实测谱 × %d 条参考谱（%s）")
+              % (len(spectra), len(refs), ref_label))
+        rows = batch_pair(
+            spectra, refs, plot,
+            progress=lambda i, n, nm: print("  [%d/%d] %s" % (i + 1, n, nm)) if nm else None)
+        out = results_dir()
+        base = _safe_name(os.path.splitext(os.path.basename(
+            os.path.abspath(pair_batch_arg)))[0]) or "批量配对"
+        csv_dst = os.path.join(out, "%s_批量配对汇总.csv" % base)
+        html_dst = os.path.join(out, "%s_批量配对汇总.html" % base)
+        write_batch_pair_csv(csv_dst, rows, ref_label)
+        try:
+            write_batch_pair_html(html_dst, rows, ref_label)
+        except Exception as exc:
+            print(T("HTML 汇总生成失败：%s") % exc)
+        print()
+        print(T("批量配对结果（按综合分升序，最可疑的排在最前）："))
+        print("  %-28s %-28s %7s %7s %9s  %s" % (
+            T("实测谱"), T("最佳参考谱"), T("综合分"), T("F1(%)"),
+            T("强峰命中"), T("参考判读")))
+        for row in sorted(rows, key=_pair_sort_key):
+            best = row.get("best")
+            if not best:
+                print("  %-28s %-28s %7s %7s %9s  %s" % (
+                    row["name"][:28], "-", "-", "-", "-",
+                    row.get("error") or T("没有可比对的参考谱")))
+                continue
+            print("  %-28s %-28s %7.1f %7.1f %9s  %s" % (
+                row["name"][:28], best["name"][:28], best["score"], best["f1"],
+                "%d/%d" % (best["strong_hit"], best["strong_n"]),
+                pair_reading(best)))
+        print()
+        print(T(_BATCH_SCORE_NOTE))
+        print(T("汇总表：%s") % csv_dst)
+        print(T("汇总报告：%s") % html_dst)
+        return 0
+
     if data_dir_arg is not None:
         if data_dir_arg:
             set_data_root(data_dir_arg)
@@ -6015,6 +6376,61 @@ def _cli(args):
                 print(T("对比图：  %s") % png)
             except Exception as exc:
                 print(T("对比图生成失败：%s") % exc)
+        return 0
+    if identify_batch_arg is not None:
+        files = [p for p in find_input_files([identify_batch_arg])
+                 if not any(os.path.basename(p).lower().endswith(sfx)
+                            for sfx in _SKIP_FILE_SUFFIXES)]
+        spectra = collect_spectra(files, plot, verbose=True)
+        if not spectra:
+            print(T("没有读到光谱：%s") % identify_batch_arg)
+            return 1
+        keys = peak_index_keys()
+        if not keys:
+            print(T("还没有可用于检索的特征索引。"))
+            print(T("请先：--rruff-get <数据包key> 然后 --identify-index（为已下载包建索引）"))
+            return 1
+        kind_low = identify_kind.strip().lower()
+        kinds = None if kind_low in ("all", "全部", "*", "") else {identify_kind.strip()}
+        print(T("批量鉴定：%d 条未知谱；检索范围 %s；已建索引的数据包 %d 个：%s")
+              % (len(spectra), T(identify_kind) if identify_kind else T("全部"),
+                 len(keys), ("、" if ui_lang() == "zh" else ", ").join(keys)))
+        if identify_must or identify_not:
+            print(T("元素筛选：必须含 [%s]；必须不含 [%s]")
+                  % (identify_must or "-", identify_not or "-"))
+        rows = batch_identify(
+            spectra, plot, keys=keys, kinds=kinds, must=identify_must,
+            not_=identify_not, top=identify_top,
+            progress=lambda i, n, nm: print("  [%d/%d] %s" % (i + 1, n, nm)) if nm else None)
+        total_entries = max([r.get("total", 0) for r in rows] or [0])
+        out = results_dir()
+        base = _safe_name(os.path.splitext(os.path.basename(
+            os.path.abspath(identify_batch_arg)))[0]) or "批量鉴定"
+        csv_dst = os.path.join(out, "%s_批量鉴定汇总.csv" % base)
+        html_dst = os.path.join(out, "%s_批量鉴定汇总.html" % base)
+        write_batch_identify_csv(csv_dst, rows, total_entries, identify_top)
+        try:
+            write_batch_identify_html(html_dst, rows, total_entries)
+        except Exception as exc:
+            print(T("HTML 汇总生成失败：%s") % exc)
+        print()
+        print(T("批量鉴定结果（按最佳候选综合分升序，最可疑的排在最前）："))
+        print("  %-28s %-26s %7s %7s  %s" % (
+            T("实测谱"), T("最佳候选"), T("综合分"), T("F1(%)"), T("参考判读")))
+        for row in sorted(rows, key=_identify_sort_key):
+            best = _best_named(row.get("candidates"))
+            if not best:
+                print("  %-28s %-26s %7s %7s  %s" % (
+                    row["name"][:28], "-", "-", "-",
+                    (row.get("verdict") or T("没有找到候选"))[:60]))
+                continue
+            f1 = best["exact_f1"] if best.get("exact_f1") is not None else best["f1"]
+            print("  %-28s %-26s %7.1f %7.1f  %s" % (
+                row["name"][:28], best["name"][:26], best["score"], f1,
+                row.get("verdict", "")[:60]))
+        print()
+        print(T("汇总表：%s") % csv_dst)
+        print(T("汇总报告：%s") % html_dst)
         return 0
     if manual_arg is not None:
         if manual_arg:
@@ -6565,6 +6981,8 @@ def _run_gui():
 
             tm = tk.Menu(bar, tearoff=0)
             tm.add_command(label="未知光谱检索（全库鉴定）…", command=self.open_identify)
+            tm.add_command(label="批量鉴定（文件夹逐条鉴定）…",
+                           command=self.tool_batch_identify)
             tm.add_separator()
             pm = tk.Menu(tm, tearoff=0)
             pm.add_command(label="手动配对（选参考谱文件 / 文件夹）…",
@@ -6574,6 +6992,9 @@ def _run_gui():
             pm.add_command(label="自动配对（本地数据库）", command=self.tool_auto_pair)
             pm.add_command(label="自动配对（在线检索并下载）…",
                            command=self.tool_auto_pair_online)
+            pm.add_separator()
+            pm.add_command(label="批量配对（文件夹 × 参考谱）…",
+                           command=self.tool_batch_pair)
             tm.add_cascade(label="配对比较（手动 / 自动）", menu=pm)
             tm.add_separator()
             tm.add_command(label="峰拟合（选中文件）", command=self.tool_fit)
@@ -7980,6 +8401,265 @@ def _run_gui():
             if state["xy"] is None:
                 status.set(T("请先在主界面左侧选中 1 条未知光谱，或点【选择文件…】。")
                            + T("第一次使用请先【建立 / 更新特征索引】。"))
+
+        def _batch_window(self, mode):
+            """批量配对 / 批量鉴定的共用窗口。
+
+            mode="pair"     多条实测谱 × 一组参考谱，逐条给最佳参考（找对不上的）
+            mode="identify" 多条陌生谱逐条全库鉴定，给最像的矿物
+            两者都只列辅助指标与「参考判读」，最终判断由使用者自己做。
+            """
+            is_pair = (mode == "pair")
+            plot = self.plot_options()
+
+            win = tk.Toplevel(self)
+            win.title(T("批量配对（文件夹 × 参考谱）") if is_pair
+                      else T("批量鉴定（文件夹逐条鉴定）"))
+            win.transient(self)
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry("%dx%d" % (min(1180, max(760, sw - 100)),
+                                    min(720, max(420, sh - 200))))
+
+            ttk.Label(
+                win,
+                text=(T("把一整个文件夹的实测谱逐条与参考谱打分，汇总成一张表；")
+                      + T("表里只有辅助指标，最后是哪个物相由你自己判断。")
+                      if is_pair else
+                      T("把一整个文件夹的谱逐条在全库里检索，汇总成一张表；")
+                      + T("每条给出最佳候选与参考判读，最终判断由你自己做。")),
+                wraplength=1100, justify="left",
+                foreground="#444").pack(anchor="w", padx=12, pady=(10, 4))
+
+            # ---- 实测谱来源：文件夹，或左侧选中 ----
+            trow = ttk.Frame(win)
+            trow.pack(fill="x", padx=12, pady=2)
+            ttk.Label(trow, text=T("实测谱文件夹：")).pack(side="left")
+            dir_var = tk.StringVar(value="")
+
+            def pick_dir():
+                d = filedialog.askdirectory(title=T("选择放实测谱的文件夹"))
+                if d:
+                    dir_var.set(d)
+
+            ttk.Entry(trow, textvariable=dir_var).pack(
+                side="left", fill="x", expand=True, padx=4)
+            ttk.Button(trow, text=T("浏览…"), command=pick_dir).pack(side="left")
+            ttk.Label(trow, text=T("（留空 = 用主界面左侧选中的光谱）"),
+                      foreground="#888").pack(side="left", padx=6)
+
+            # ---- 参考谱（只配对需要）----
+            ref_var = tk.StringVar(value="lib")
+            ref_dir_var = tk.StringVar(value="")
+            if is_pair:
+                rrow = ttk.Frame(win)
+                rrow.pack(fill="x", padx=12, pady=2)
+                ttk.Label(rrow, text=T("参考谱：")).pack(side="left")
+                ttk.Radiobutton(rrow, text=T("本地参考谱库（%d 条）") % len(db_list()),
+                                variable=ref_var, value="lib").pack(side="left")
+                ttk.Radiobutton(rrow, text=T("指定文件夹 / 文件："),
+                                variable=ref_var, value="dir").pack(side="left", padx=(10, 2))
+
+                def pick_ref():
+                    d = filedialog.askdirectory(title=T("选择参考谱文件夹"))
+                    if d:
+                        ref_dir_var.set(d)
+                        ref_var.set("dir")
+
+                ttk.Entry(rrow, textvariable=ref_dir_var).pack(
+                    side="left", fill="x", expand=True, padx=4)
+                ttk.Button(rrow, text=T("浏览…"), command=pick_ref).pack(side="left")
+
+            # ---- 鉴定选项 ----
+            top_var = tk.StringVar(value="5")
+            must_var = tk.StringVar(value="")
+            not_var = tk.StringVar(value="")
+            if not is_pair:
+                orow = ttk.Frame(win)
+                orow.pack(fill="x", padx=12, pady=2)
+                ttk.Label(orow, text=T("候选个数：")).pack(side="left")
+                ttk.Entry(orow, textvariable=top_var, width=5).pack(side="left")
+                ttk.Label(orow, text=T("必须含元素：")).pack(side="left", padx=(12, 2))
+                ttk.Entry(orow, textvariable=must_var, width=10).pack(side="left")
+                ttk.Label(orow, text=T("必须不含：")).pack(side="left", padx=(8, 2))
+                ttk.Entry(orow, textvariable=not_var, width=10).pack(side="left")
+                ttk.Label(orow, text=T("（如 Zr Si，空格分隔；不知道就留空）"),
+                          foreground="#888").pack(side="left", padx=6)
+
+            brow = ttk.Frame(win)
+            brow.pack(fill="x", padx=12, pady=(6, 2))
+            run_btn = ttk.Button(brow, text=T("开始批量处理"))
+            run_btn.pack(side="left")
+            csv_btn = ttk.Button(brow, text=T("打开汇总表 CSV"), state="disabled")
+            csv_btn.pack(side="right")
+            html_btn = ttk.Button(brow, text=T("打开汇总报告 HTML"), state="disabled")
+            html_btn.pack(side="right", padx=6)
+            ttk.Button(brow, text=T("关闭"), command=win.destroy).pack(side="right")
+
+            status = tk.StringVar(value=T("选好文件夹后点【开始批量处理】。"))
+            ttk.Label(win, textvariable=status, foreground="#1a4a8a",
+                      wraplength=1100, justify="left").pack(anchor="w", padx=12)
+
+            heads = BATCH_PAIR_COLUMNS if is_pair else BATCH_IDENTIFY_COLUMNS
+            if is_pair:
+                widths = (250, 64, 64, 230, 60, 56, 64, 64, 64, 64, 64, 88, 68, 68,
+                          64, 92, 260)
+            else:
+                widths = (250, 64, 64, 170, 84, 50, 54, 60, 56, 64, 64, 64, 64, 88,
+                          68, 74, 68, 300)
+            box = ttk.LabelFrame(win, text=T("结果（按综合分升序，最可疑的在前）"))
+            box.pack(fill="both", expand=True, padx=12, pady=(6, 10))
+            inner = ttk.Frame(box)
+            inner.pack(fill="both", expand=True, padx=6, pady=6)
+            cols = tuple("c%d" % i for i in range(len(heads)))
+            tree = ttk.Treeview(inner, columns=cols, show="headings", selectmode="browse")
+            for c, h, w in zip(cols, heads, widths):
+                tree.heading(c, text=T(h))
+                tree.column(c, width=w, anchor="w")
+            ysb = ttk.Scrollbar(inner, orient="vertical", command=tree.yview)
+            xsb = ttk.Scrollbar(inner, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+            tree.grid(row=0, column=0, sticky="nsew")
+            ysb.grid(row=0, column=1, sticky="ns")
+            xsb.grid(row=1, column=0, sticky="ew")
+            inner.rowconfigure(0, weight=1)
+            inner.columnconfigure(0, weight=1)
+
+            state = {"rows": [], "csv": "", "html": ""}
+
+            def target_spectra():
+                """返回 (光谱列表, 用来命名输出文件的标签)。"""
+                folder = dir_var.get().strip()
+                if folder:
+                    files = [p for p in find_input_files([folder])
+                             if not any(os.path.basename(p).lower().endswith(sfx)
+                                        for sfx in _SKIP_FILE_SUFFIXES)]
+                    return (collect_spectra(files, plot, verbose=False),
+                            os.path.basename(os.path.abspath(folder)))
+                return self._selected_spectra(), T("主界面选中")
+
+            def fill(rows, order_key, row_fn):
+                tree.delete(*tree.get_children())
+                for i, r in enumerate(sorted(rows, key=order_key)):
+                    tree.insert("", "end", iid=str(i), values=tuple(row_fn(r)))
+
+            def open_file(path):
+                if path and os.path.isfile(path):
+                    try:
+                        os.startfile(path)
+                        return
+                    except OSError:
+                        pass
+                status.set(T("文件不存在：%s") % path)
+
+            def run():
+                run_btn.configure(state="disabled")
+                win.update_idletasks()
+
+                def tick(i, n, name):
+                    if name:
+                        status.set(T("正在处理 %d/%d：%s") % (i + 1, n, name))
+                        win.update_idletasks()
+
+                try:
+                    spectra, label = target_spectra()
+                    if not spectra:
+                        status.set(T("没有读到实测谱：请选一个文件夹，或先在主界面左侧选中光谱。"))
+                        return
+                    out = results_dir()
+                    base = _safe_name(label) or T("批量结果")
+                    if is_pair:
+                        if ref_var.get() == "lib":
+                            ref_paths = db_list()
+                            ref_label = T("本地参考谱库")
+                        else:
+                            rp = ref_dir_var.get().strip()
+                            if not rp:
+                                status.set(T("请先指定参考谱文件夹或文件。"))
+                                return
+                            ref_paths = find_input_files([rp])
+                            ref_label = os.path.basename(os.path.abspath(rp))
+                        refs = load_reference_set(ref_paths)
+                        if not refs:
+                            status.set(T("参考谱一条也读不出来（需要两列文本 / CSV）：%s")
+                                       % ref_label)
+                            return
+                        status.set(T("正在批量配对：%d 条实测谱 × %d 条参考谱…")
+                                   % (len(spectra), len(refs)))
+                        win.update_idletasks()
+                        rows = batch_pair(spectra, refs, plot, progress=tick)
+                        csv_path = os.path.join(out, "%s_批量配对汇总.csv" % base)
+                        html_path = os.path.join(out, "%s_批量配对汇总.html" % base)
+                        write_batch_pair_csv(csv_path, rows, ref_label)
+                        fill(rows, _pair_sort_key, batch_pair_row)
+                        bad = sum(1 for r in rows
+                                  if not r.get("best") or r["best"]["score"] < 35)
+                        self._log(T("批量配对完成：%d 条实测谱 × %d 条参考谱，"
+                                    "其中 %d 条匹配很差（<35 分）")
+                                  % (len(rows), len(refs), bad))
+                        status.set(T("完成：%d 条；其中 %d 条匹配很差（<35 分），"
+                                     "已排在最前。汇总表：%s")
+                                   % (len(rows), bad, csv_path))
+                    else:
+                        keys = peak_index_keys()
+                        if not keys:
+                            status.set(T("还没有可用于检索的特征索引："
+                                         "请先在【未知光谱检索】窗口里建立索引。"))
+                            return
+                        try:
+                            top = max(1, int(float(top_var.get())))
+                        except ValueError:
+                            top = 5
+                        status.set(T("正在批量鉴定：%d 条谱 × %d 个数据包…")
+                                   % (len(spectra), len(keys)))
+                        win.update_idletasks()
+                        rows = batch_identify(spectra, plot, keys=keys, kinds=None,
+                                              must=must_var.get(), not_=not_var.get(),
+                                              top=top, progress=tick)
+                        total_entries = max([r.get("total", 0) for r in rows] or [0])
+                        csv_path = os.path.join(out, "%s_批量鉴定汇总.csv" % base)
+                        html_path = os.path.join(out, "%s_批量鉴定汇总.html" % base)
+                        write_batch_identify_csv(csv_path, rows, total_entries, top)
+                        fill(rows, _identify_sort_key, batch_identify_row)
+                        bad = 0
+                        for r in rows:
+                            b = _best_named(r.get("candidates"))
+                            if b is None or b["score"] < 35:
+                                bad += 1
+                        self._log(T("批量鉴定完成：%d 条谱，比对 %d 条参考记录，"
+                                    "其中 %d 条没有可靠匹配（<35 分）")
+                                  % (len(rows), total_entries, bad))
+                        status.set(T("完成：%d 条；其中 %d 条没有可靠匹配（<35 分），"
+                                     "已排在最前。汇总表：%s")
+                                   % (len(rows), bad, csv_path))
+                    state["rows"] = rows
+                    state["csv"] = csv_path
+                    state["html"] = html_path
+                    try:
+                        if is_pair:
+                            write_batch_pair_html(html_path, rows, ref_label)
+                        else:
+                            write_batch_identify_html(html_path, rows, total_entries)
+                        self._log(T("汇总报告：%s") % html_path)
+                    except Exception as exc:
+                        self._log(T("HTML 汇总生成失败：%s") % exc)
+                    csv_btn.configure(state="normal",
+                                      command=lambda: open_file(csv_path))
+                    html_btn.configure(state="normal",
+                                       command=lambda: open_file(html_path))
+                except Exception as exc:
+                    status.set(T("批量处理失败：%s") % exc)
+                finally:
+                    run_btn.configure(state="normal")
+
+            run_btn.configure(command=run)
+
+        def tool_batch_pair(self):
+            """批量配对：一整个文件夹的实测谱 × 一组参考谱，找对不上的。"""
+            self._batch_window("pair")
+
+        def tool_batch_identify(self):
+            """批量鉴定：一整个文件夹的未知谱逐条全库检索。"""
+            self._batch_window("identify")
 
         def tool_pair_manual(self):
             specs = self._selected_spectra()
@@ -9942,7 +10622,7 @@ def _run_gui():
     app.mainloop()
 
 
-_MANUAL_VERSION = "2.2"
+_MANUAL_VERSION = "2.3"
 _MANUAL_TITLE = "拉曼光谱工具 · 使用说明书"
 _MANUAL_MARKER = "（说明书版本：%s）" % _MANUAL_VERSION
 _MANUAL_MARKER_EN = "(guide version: %s)" % _MANUAL_VERSION
@@ -10397,6 +11077,96 @@ ERR 叠加图 -> %s||ERR overlay -> %s
 叠加图：%s（标注 %d 个峰位）||Overlay: %s (%d peaks marked)
 预览需要 Pillow（pip install pillow）。||The preview needs Pillow (pip install pillow).
 (留空 = 最小峰间距)||(blank = minimum peak separation)
+== 批量配对汇总 ==\\n||== Batch pairing summary ==\\n
+== 批量未知谱鉴定汇总 ==\\n||== Batch identification summary ==\\n
+批量配对汇总||Batch pairing summary
+批量未知谱鉴定汇总||Batch identification summary
+参考谱集：%s||Reference set: %s
+参考谱集：%s\\n||Reference set: %s\\n
+实测谱||Measured spectra
+实测谱：%d 条\\n||Measured spectra: %d\\n
+实测谱：%d 条；峰位匹配容差 %.0f cm-1\\n||Measured spectra: %d; peak matching tolerance %.0f cm-1\\n
+参与检索条目数：%d||Reference records searched: %d
+综合分 = 0.5×F1 + 0.5×强峰命中率（与「未知谱鉴定」同一口径）；这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。||Score = 0.5 x F1 + 0.5 x strong-peak hit rate (the same scoring as "Unknown spectrum search"); these are advisory metrics only - check the peaks and the profile yourself before deciding the phase.
+峰位匹配容差||Peak matching tolerance
+排序||Ordering
+按综合分升序（最可疑的在前）||Ascending composite score (most doubtful first)
+按最佳候选综合分升序（最可疑的在前）||Ascending best-candidate composite score (most doubtful first)
+逐条配对结果||Per-spectrum pairing result
+逐条鉴定结果||Per-spectrum identification result
+（按综合分升序排列：最可疑的排在最前面）\\n||(sorted by ascending composite score: the most doubtful come first)\\n
+（按最佳候选的综合分升序排列：最可疑的排在最前面）\\n||(sorted by ascending best-candidate composite score: the most doubtful come first)\\n
+匹配良好，可作同一物相（参考判读）||Good match; can be treated as the same phase (advisory only)
+部分匹配，建议核对峰位对照（参考判读）||Partial match; check the peak table (advisory only)
+匹配很差，很可能不是同一物相（参考判读）||Poor match; probably not the same phase (advisory only)
+没有可比对的参考谱||No reference spectrum to compare against
+与参考谱没有可比对的峰（波数区间不重叠或参考谱没有峰）||No comparable peaks with the reference (wavenumber ranges do not overlap, or the reference has no peaks)
+这条光谱没有识别到峰||No peaks detected in this spectrum
+没有找到候选||No candidate found
+参考判读||Advisory reading
+最佳参考谱||Best reference
+最佳候选||Best candidate
+强峰总数||Strong peaks total
+命中峰数||Matched peaks
+实测峰数||Measured peaks
+参考峰数||Reference peaks
+平均偏差(cm-1)||Mean deviation (cm-1)
+谱角(度)||Spectral angle (deg)
+领先第二名(分)||Lead over runner-up (pts)
+文件名||File name
+数据点数||Data points
+识别峰数||Peaks detected
+F1 为峰位匹配 F1（容差 %.0f cm-1，命中<2 记 0）。||F1 is the peak-matching F1 (tolerance %.0f cm-1; fewer than 2 matches scores 0).
+这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。||These are advisory metrics only; please check the peaks and the profile yourself before deciding the phase.
+这些只是辅助指标，最终是哪个物相请自行核对峰位与谱型。\\n||These are advisory metrics only; please check the peaks and the profile yourself before deciding the phase.\\n
+批量配对（文件夹 × 参考谱）||Batch pairing (folder x reference spectra)
+批量鉴定（文件夹逐条鉴定）||Batch identification (identify a whole folder)
+批量配对（文件夹 × 参考谱）…||Batch pairing (folder x reference spectra)...
+批量鉴定（文件夹逐条鉴定）…||Batch identification (identify a whole folder)...
+把一整个文件夹的实测谱逐条与参考谱打分，汇总成一张表；||Scores every measured spectrum in a folder against the reference set and summarises them in one table;
+表里只有辅助指标，最后是哪个物相由你自己判断。||The table holds advisory metrics only; you decide which phase it really is.
+把一整个文件夹的谱逐条在全库里检索，汇总成一张表；||Searches every spectrum in a folder against the whole library and summarises them in one table;
+每条给出最佳候选与参考判读，最终判断由你自己做。||Each row gives the best candidate and an advisory reading; the final call is yours.
+实测谱文件夹：||Measured-spectra folder:
+选择放实测谱的文件夹||Choose the folder holding the measured spectra
+浏览…||Browse...
+（留空 = 用主界面左侧选中的光谱）||(blank = use the spectra selected in the main window)
+参考谱：||Reference spectra:
+本地参考谱库||Local reference library
+本地参考谱库（%d 条）||Local reference library (%d)
+指定文件夹 / 文件：||Specified folder / file:
+选择参考谱文件夹||Choose the reference folder
+候选个数：||Candidates:
+开始批量处理||Run batch
+打开汇总表 CSV||Open summary CSV
+打开汇总报告 HTML||Open summary report (HTML)
+选好文件夹后点【开始批量处理】。||Pick a folder, then press "Run batch".
+结果（按综合分升序，最可疑的在前）||Results (ascending composite score, most doubtful first)
+主界面选中||main-window selection
+批量结果||batch result
+正在处理 %d/%d：%s||Processing %d/%d: %s
+正在批量配对：%d 条实测谱 × %d 条参考谱…||Batch pairing: %d measured spectra x %d reference spectra...
+正在批量鉴定：%d 条谱 × %d 个数据包…||Batch identification: %d spectra x %d data packages...
+没有读到实测谱：请选一个文件夹，或先在主界面左侧选中光谱。||No spectra loaded: choose a folder, or select spectra in the main window first.
+请先指定参考谱文件夹或文件。||Specify the reference folder or file first.
+文件不存在：%s||File not found: %s
+批量处理失败：%s||Batch run failed: %s
+批量配对完成：%d 条实测谱 × %d 条参考谱，其中 %d 条匹配很差（<35 分）||Batch pairing done: %d measured spectra x %d references, %d of them matched poorly (< 35)
+完成：%d 条；其中 %d 条匹配很差（<35 分），已排在最前。汇总表：%s||Done: %d spectra; %d matched poorly (< 35) and are listed first. Summary: %s
+批量鉴定完成：%d 条谱，比对 %d 条参考记录，其中 %d 条没有可靠匹配（<35 分）||Batch identification done: %d spectra, %d reference records compared, %d without a reliable match (< 35)
+完成：%d 条；其中 %d 条没有可靠匹配（<35 分），已排在最前。汇总表：%s||Done: %d spectra; %d without a reliable match (< 35) and listed first. Summary: %s
+还没有可用于检索的特征索引：请先在【未知光谱检索】窗口里建立索引。||No feature index is available yet: build one in the "Unknown spectrum search" window first.
+批量配对：%d 条实测谱 × %d 条参考谱（%s）||Batch pairing: %d measured spectra x %d reference spectra (%s)
+批量配对结果（按综合分升序，最可疑的排在最前）：||Batch pairing result (ascending composite score, most doubtful first):
+批量鉴定：%d 条未知谱；检索范围 %s；已建索引的数据包 %d 个：%s||Batch identification: %d unknown spectra; search scope %s; %d packages indexed: %s
+批量鉴定结果（按最佳候选综合分升序，最可疑的排在最前）：||Batch identification result (ascending best-candidate score, most doubtful first):
+汇总表：%s||Summary table: %s
+汇总报告：%s||Summary report: %s
+没有找到参考谱：用 --pair-ref 指定参考谱文件或文件夹，||No reference spectra found: use --pair-ref to point at a file or folder,
+或先用 --db-get 把参考谱下载到本地库。||or download references into the local library with --db-get first.
+参考谱一条也读不出来（需要两列文本 / CSV）：%s||Not one reference spectrum could be read (two-column text / CSV required): %s
+没有读到待配对的实测谱：%s||No measured spectra to pair were loaded: %s
+HTML 汇总生成失败：%s||Generating the HTML summary failed: %s
 特征索引：%s -> %d 条||Feature index: %s -> %d entries
 相似度矩阵（%d×%d）→ %s||Similarity matrix (%dx%d) -> %s
 相减完成：A=%s  B=%s（%d 点）→ %s||Subtraction done: A=%s  B=%s (%d points) -> %s
@@ -11078,6 +11848,8 @@ A1g（最强）||A1g (strongest)
     jws2csv.py 文件/文件夹 [--xlsx --png --csv --peaks]    批量转换||    jws2csv.py FILE/FOLDER [--xlsx --png --csv --peaks]    batch convert
     jws2csv.py --identify 文件           未知光谱全库鉴定||    jws2csv.py --identify FILE        identify an unknown spectrum
     jws2csv.py --pair 文件               与本地库自动配对||    jws2csv.py --pair FILE            auto-pair against the local library
+    jws2csv.py --pair-batch 文件夹       批量配对（找对不上的）||    jws2csv.py --pair-batch FOLDER    batch pairing (spot the mismatches)
+    jws2csv.py --identify-batch 文件夹   批量鉴定（逐条给最佳候选）||    jws2csv.py --identify-batch FOLDER  batch identification (best candidate each)
     jws2csv.py --rruff-list              查看 RRUFF 数据包||    jws2csv.py --rruff-list           list RRUFF data packages
     jws2csv.py --mineral-search 名称     查内置矿物特征峰表||    jws2csv.py --mineral-search NAME  query the built-in mineral table
     jws2csv.py --manual [路径]           打印 / 导出说明书||    jws2csv.py --manual [PATH]        print / export the guide
@@ -11430,6 +12202,40 @@ _MANUAL_SECTIONS = [
     报告 CSV（排名表 + 最佳配对的峰位对照）
     报告图 PNG（叠加曲线 + 峰位配对连线 + 排名表）
 
+批量配对（一整个文件夹 × 参考谱）
+  菜单【分析工具】→【配对比较（手动 / 自动）】→【批量配对（文件夹 × 参考谱）…】，
+  命令行 --pair-batch 文件夹 [--pair-ref 参考谱文件夹]。
+  上面那些配对一次只处理一条谱，这个是外层批量：
+    · 实测谱：指定一个文件夹（留空则用主界面左侧选中的光谱）；
+    · 参考谱：本地参考谱库，或自己指定的文件夹 / 文件；
+    · 逐条打分后汇总成一张表，一条实测谱一行。
+  典型用法：手里一批锆石，拿锆石标准谱当参考集，汇总表里综合分低的
+  就是“可能混了别的晶”的，它们会被排在最前面。
+
+批量鉴定（一整个文件夹逐条鉴定）
+  菜单【分析工具】→【批量鉴定（文件夹逐条鉴定）…】，
+  命令行 --identify-batch 文件夹 --identify-top 5。
+  手上是一堆不认识的谱时用：逐条在全库里找最像的矿物，每条给出最佳候选、
+  综合分、F1 与结论文本，汇总成一张表。
+  需要先有特征索引（在【未知光谱检索】窗口里建，或命令行 --identify-index）。
+
+汇总表里列了什么
+  · 综合分 = 0.5×F1 + 0.5×强峰命中率（与「未知谱鉴定」同一口径）；
+  · F1、强峰命中、命中 / 实测 / 参考峰数、平均偏差、相关系数、谱角、
+    偶然概率、领先第二名（参考谱多于一条时才有意义）。
+  · “参考判读”一列只是按分数给的提示（匹配良好 / 部分匹配 / 匹配很差），
+    不下最终结论 —— 到底是不是同一种物相，请自己核对峰位与谱型。
+  输出（放在“工具数据/分析结果”）：
+    汇总表 CSV（一条谱一行，按综合分升序：最可疑的排最前）
+    汇总报告 HTML（同一张表，浏览器里可直接打印为 PDF）
+  小技巧：表里综合分低的行，可以再单独对它跑一次【自动配对】，
+          会生成峰位对照表与报告图，细看差在哪几个峰。
+
+  两个口径说明：
+  · 只识别到 1 个峰的谱，F1 一律记 0（命中<2 不算识别），综合分因此封顶
+    50，会一直停在“部分匹配”档 —— 这是故意的，单峰不足以定案；
+  · 命令行 --pair-batch / --identify-batch 是批处理，没有界面窗口。
+
 提醒：配对是筛选辅助，最终请结合峰位对照表与谱图判断。
       实测与参考常有 3~5 cm-1 校准差，超过容差会判“未匹配”，
       可用第 7 章的“拉曼位移校准”先修正再配对。"""),
@@ -11607,6 +12413,8 @@ _MANUAL_SECTIONS = [
   --batch 文件夹 [--out 目录]
   --report [文件或文件夹] [--out 目录]
   --pair 文件 / --db-match 文件
+  --pair-batch 文件夹 [--pair-ref 参考谱文件夹]   批量配对（一条谱一行汇总）
+  --identify-batch 文件夹 [--identify-top 5]      批量鉴定（逐条给最佳候选）
 
 数据库与矿物
   --db-search 矿物名  --db-get 编号  --db-ls
@@ -12149,7 +12957,53 @@ Pairing (manual / automatic)
   matched peaks so that peak-rich references cannot win by coincidence),
   followed by the correlation coefficient and the spectral angle. The result is
   a ranking CSV plus a pairing report PNG that shows the overlaid curves, the
-  matched peaks, the ranking table and the peak comparison table."""),
+  matched peaks, the ranking table and the peak comparison table.
+
+  Batch pairing (a whole folder x reference set)
+    [Analysis -> Pairing (manual / auto) -> Batch pairing (folder x reference
+    spectra)...], or --pair-batch FOLDER [--pair-ref REF_FOLDER].
+    The pairing entries above handle ONE spectrum at a time; this is the batch
+    wrapper around them:
+      . measured spectra: point at a folder (leave blank to use the spectra
+        selected in the main window);
+      . references: the local reference library, or a folder / file you pick;
+      . every spectrum is scored against the reference set and summarised as
+        one row per measured spectrum.
+    Typical use: a batch of zircons scored against zircon references - the rows
+    with a low score are the ones that may contain another crystal, and they are
+    listed first.
+
+  Batch identification (identify a whole folder)
+    [Analysis -> Batch identification (identify a whole folder)...], or
+    --identify-batch FOLDER --identify-top 5.
+    For a pile of spectra you do not recognise: each one is searched against the
+    whole library and the table lists the best candidate, the score, F1 and the
+    conclusion text.
+    Needs a feature index first (build it in the "Unknown spectrum search"
+    window, or with --identify-index).
+
+  What the summary table contains
+    . score = 0.5 x F1 + 0.5 x strong-peak hit rate (the same scoring as
+      "Unknown spectrum search");
+    . F1, strong-peak hits, matched / measured / reference peak counts, mean
+      deviation, correlation, spectral angle, chance probability and the lead
+      over the runner-up (meaningful only when the reference set has more than
+      one entry);
+    . the "Advisory reading" column is only a hint derived from the score
+      (good match / partial match / poor match). It does NOT decide for you:
+      check the peaks and the profile yourself before calling the phase.
+    Output (into 工具数据/分析结果):
+      summary CSV (one row per spectrum, ascending score, most doubtful first)
+      summary report HTML (same table, printable to PDF from a browser)
+    Tip: for a low-scoring row, run the single-spectrum [Auto pairing] on it to
+         get the peak comparison table and the report image, and see which peaks
+         disagree.
+
+    Two notes on the scoring:
+    . a spectrum with only ONE detected peak always scores F1 = 0 (fewer than
+      two matches does not count), so its score caps at 50 and it stays in the
+      "partial match" band - on purpose, since one peak cannot settle anything;
+    . --pair-batch / --identify-batch are batch-only; they open no window."""),
 
     ("12. Spectrum arithmetic", """All in the [Analysis] menu.
 
@@ -12311,6 +13165,8 @@ Analysis
   --cluster [FILE|FOLDER] [--cluster-cut 0.2]    clustering + PCA
   --map 5,5 [--map-metric main_peak|intensity|fwhm|peaks|total|at:1000]
   --pair FILE                                    auto-pair against the local library
+  --pair-batch FOLDER [--pair-ref REF_FOLDER]    batch pairing (one row per spectrum)
+  --identify-batch FOLDER [--identify-top 5]     batch identification (best candidate each)
   --compare FILE --ref FILE                      compare with one reference
   --average FILES / --subtract A B / --waterfall FILES
   --report FILES                                 HTML report

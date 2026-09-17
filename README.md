@@ -28,9 +28,9 @@
 | --- | --- |
 | **格式转换** | `.jws`/CSV/SPC/JCAMP-DX/TXT → CSV、**带图的 Excel**、PNG 曲线图、峰列表、JCAMP-DX |
 | **峰分析** | 自动找峰并标注峰位（**峰位带波长虚线**）、**标错的峰连同自动峰一起右键删除、可一键恢复**、手动补标、高斯/洛伦兹/伪 Voigt 峰拟合、峰位检索；峰位数值可一键隐藏 |
-| **未知谱鉴定** | 不知道样品是什么？拿它的峰去整个参考库比对，按可信度给出候选矿物 + 峰位对照 |
+| **未知谱鉴定** | 不知道样品是什么？拿它的峰去整个参考库比对，按可信度给出候选矿物 + 峰位对照；**批量鉴定**可一次把一个文件夹的谱逐条给出最佳候选 |
 | **参考谱库** | 在线检索 ROD、按矿物批量抓取 RRUFF 数据包（拉曼 / 红外 / XRD / 化学成分），导出为本地库 |
-| **配对比较** | 实测谱 ↔ 标准谱手动/自动配对，输出峰位匹配 F1、相关系数、谱角与对照报告图 |
+| **配对比较** | 实测谱 ↔ 标准谱手动/自动配对，输出峰位匹配 F1、相关系数、谱角与对照报告图；**批量配对**可拿一组标准谱一次筛一个文件夹，**对不上的排在最前面**（综合分、F1、相关系数等全列出来，判读只是提示，结论自己下） |
 | **预处理** | 尖峰（宇宙射线）去除、基线校正、平滑、导数、归一化、拉曼位移校准 |
 | **统计分析** | 层次聚类 + PCA、二维成像热图、平均/相减、谱段替换、交互式 A−k·B 找平 |
 | **多谱对照** | **瀑布图**（纵向错开，看有哪些峰）+ **多数据图叠加**（按 stacked spectra 排布：各条**上下错开、谱线分开**，每条一色带图例；**峰位跨谱合并，一个峰只画一条虚线、只标一个平均波数**；**先预览、左键加峰 / 右键删峰，确认后再导出**；横坐标取各条**交集**，可导出 PNG） |
@@ -59,7 +59,7 @@
 
 ### 方式一：绿色版（推荐，免安装）
 
-1. 到 **[Releases](../../releases)** 下载 `RamanSpectrumToolkit-v2.0.zip`
+1. 到 **[Releases](../../releases)** 下载最新的 `RamanSpectrumToolkit-v2.x.zip`
 2. 解压到任意目录（含中文路径也可以）
 3. 双击 `RamanSpectrumToolkit.exe`
 
@@ -82,6 +82,8 @@ python jws2csv.py a.jws 某文件夹              # 批量转换
 python jws2csv.py --all a.jws                # CSV + Excel + PNG + 峰列表 + 峰拟合
 python jws2csv.py --identify unknown.csv     # 未知光谱全库鉴定
 python jws2csv.py --pair unknown.csv         # 与本地参考谱库配对
+python jws2csv.py --pair-batch 待测文件夹 --pair-ref 锆石标准谱   # 批量配对，对不上的排最前
+python jws2csv.py --identify-batch 待测文件夹 --identify-top 5    # 批量鉴定，逐条给最佳候选
 python jws2csv.py --rruff-fetch Zircon       # 一键下载 + 检索 + 导出锆石参考谱
 python jws2csv.py --mineral-info Zircon      # 矿物信息卡（特征峰归属 + RRUFF 样品记录）
 python jws2csv.py --cluster 文件夹           # 聚类分析 + 主成分
@@ -103,6 +105,23 @@ python jws2csv.py --manual                   # 打印完整说明书
 * **可信候选**要求三条同时成立：综合分 ≥ 60、未知谱最强 3 个峰至少命中 2 个、且领先第二名 ≥ 15 分
 * 同时给出**偶然概率**（二项分布），分数接近时明确提醒“可能是库里没有对应矿物”
 * 未命名样品单独提示，不会用没有矿物名的记录冒充结论
+
+## 批量配对 / 批量鉴定
+
+单条谱的鉴定与配对都只能一次处理一条。**批量**版本在外面套一层循环，
+一次吃一整个文件夹，汇总成一条谱一行的表：
+
+* **批量配对**：拿一组参考谱（比如一批锆石标准谱）去筛一个文件夹的实测谱。
+  汇总表**按综合分升序排**——对不上的排在最前面，一眼就能看到可疑的。
+* **批量鉴定**：一堆不认识的谱，逐条在全库里找最像的矿物，给出最佳候选与结论文本。
+* **汇总表列的是辅助数据**：综合分（与上面「未知谱鉴定」同一口径，所以两处数字对得上）、
+  F1、强峰命中、命中 / 实测 / 参考峰数、平均偏差、相关系数、谱角、偶然概率、领先第二名。
+* **「参考判读」一列只是提示**（匹配良好 / 部分匹配 / 匹配很差），
+  **不下最终结论**——到底是不是同一种物相，请自己核对峰位与谱型。
+  表里某一行可疑，可以再单独对它跑一次配对，看峰位对照表差在哪几个峰。
+* 输出：汇总表 `CSV` + 汇总报告 `HTML`（浏览器里可直接打印为 PDF）。
+* 注意：只识别到 **1 个峰**的谱，F1 一律记 0（命中 < 2 不算识别），
+  综合分因此封顶 50、一直停在「部分匹配」档。这是故意的——单个峰定不了案。
 
 ## 中文 / 英文
 
@@ -146,9 +165,9 @@ The GUI, CLI, reports and manuals are **fully bilingual (Chinese / English)**.
 | --- | --- |
 | **Conversion** | `.jws` / CSV / SPC / JCAMP-DX / TXT → CSV, **Excel with embedded chart**, PNG plot, peak table, JCAMP-DX |
 | **Peak analysis** | automatic peak detection with position labels (**each peak gets a dashed line down to the x axis**), **right-click to delete a wrong peak — automatic ones included — and restore them all with one click**, manual annotation, Gaussian / Lorentzian / pseudo-Voigt fitting, peak-position search; peak values can be hidden |
-| **Unknown spectra** | identify a spectrum whose mineral you do not know by matching its peaks against a whole reference library, with confidence ranking and a peak-by-peak comparison |
+| **Unknown spectra** | identify a spectrum whose mineral you do not know by matching its peaks against a whole reference library, with confidence ranking and a peak-by-peak comparison; **batch identification** runs a whole folder and gives the best candidate per spectrum |
 | **Reference libraries** | search ROD online, bulk-fetch RRUFF packages (Raman / IR / XRD / chemistry), export them into a local library |
-| **Pairing** | measured ↔ reference pairing (manual or automatic) with peak-match F1, correlation, spectral angle, and a comparison report figure |
+| **Pairing** | measured ↔ reference pairing (manual or automatic) with peak-match F1, correlation, spectral angle, and a comparison report figure; **batch pairing** screens a whole folder against a reference set and **puts the mismatches first** (score, F1, correlation and more — the reading is advisory, you decide) |
 | **Preprocessing** | spike (cosmic ray) removal, baseline correction, smoothing, derivative, normalization, Raman shift calibration |
 | **Statistics** | hierarchical clustering + PCA, 2D imaging heat map, average / subtract, range replacement, interactive A−k·B flattening |
 | **Multi-spectrum comparison** | **waterfall** (offset stacks, to see *which* peaks are there) + **multi-dataset overlay** (stacked-spectra layout: curves **offset and separated**, one colour each with a legend; **peaks merged across datasets — one dashed line and one averaged value per peak**; **preview first, left-click to add / right-click to remove peaks, export only after you confirm**; x axis is the **intersection** of all ranges) |
@@ -158,7 +177,7 @@ The GUI, CLI, reports and manuals are **fully bilingual (Chinese / English)**.
 
 **Portable build (no Python needed)**
 
-1. Download `RamanSpectrumToolkit-v2.0.zip` from **[Releases](../../releases)**
+1. Download the latest `RamanSpectrumToolkit-v2.x.zip` from **[Releases](../../releases)**
 2. Unpack anywhere and run `RamanSpectrumToolkit.exe`
 
 Everything the tool downloads or produces stays inside `工具数据/` next to the executable,
@@ -176,6 +195,8 @@ python jws2csv.py
 ```bash
 python jws2csv.py --identify unknown.csv    # identify an unknown spectrum
 python jws2csv.py --pair unknown.csv        # pair against your local library
+python jws2csv.py --pair-batch FOLDER --pair-ref ZIRCON_REFS   # batch pairing, mismatches first
+python jws2csv.py --identify-batch FOLDER --identify-top 5     # batch identification, best candidate each
 python jws2csv.py --rruff-fetch Zircon      # download + index + export Zircon references
 python jws2csv.py --waterfall folder        # waterfall chart (offset stacks)
 python jws2csv.py --overlay folder          # multi-dataset overlay, one colour each (batch, no preview)
@@ -193,6 +214,26 @@ the score ≥ 60, at least 2 of the 3 strongest peaks are matched, and it leads 
 points; a binomial **chance probability** is reported and close scores trigger an explicit warning
 that the mineral may simply not be in the library. Unnamed RRUFF records are never presented as an
 identification.
+
+### Batch pairing / batch identification
+
+Identification and pairing each handle ONE spectrum at a time. The **batch** versions wrap a loop
+around them and take a whole folder, producing a one-row-per-spectrum table:
+
+* **Batch pairing** — screen a folder of measured spectra against a reference set (say a batch of
+  zircon references). The table is **sorted by ascending score, so the mismatches come first**.
+* **Batch identification** — for a pile of unrecognised spectra, each one is searched against the
+  whole library and gets a best candidate plus the conclusion text.
+* **The table holds advisory metrics**: the combined score (the same scoring as above, so the two
+  places agree), F1, strong-peak hits, matched / measured / reference peak counts, mean deviation,
+  correlation, spectral angle, chance probability and the lead over the runner-up.
+* **The "Advisory reading" column is a hint only** (good match / partial match / poor match).
+  It does **not** decide for you — check the peaks and the profile yourself. If a row looks off,
+  run the single-spectrum pairing on it to see which peaks disagree.
+* Output: a summary `CSV` plus a summary report `HTML` (printable to PDF from a browser).
+* Note: a spectrum with only **one** detected peak always gets F1 = 0 (fewer than 2 matches does
+  not count), so its score caps at 50 and it stays in the "partial match" band. That is deliberate —
+  one peak cannot settle anything.
 
 ### Credits
 
