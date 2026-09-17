@@ -214,7 +214,7 @@ def main():
         _st, rel = call("POST", "%s/repos/%s/%s/releases" % (API, OWNER, REPO),
                         {"tag_name": tag, "target_commitish": "main",
                          "name": "%s · 拉曼光谱工具 Raman Spectrum Toolkit" % tag,
-                         "body": RELEASE_BODY % {"tag": tag},
+                         "body": RELEASE_BODY.replace("__TAG__", tag),
                          "draft": False, "prerelease": False})
         print("· Release 已创建：%s" % rel.get("html_url"))
 
@@ -234,7 +234,7 @@ def main():
     print("\n完成 → https://github.com/%s/%s" % (OWNER, REPO))
 
 
-RELEASE_BODY = """## 拉曼光谱工具 · Raman Spectrum Toolkit %(tag)s
+RELEASE_BODY = """## 拉曼光谱工具 · Raman Spectrum Toolkit __TAG__
 
 JASCO `.jws` 光谱转换 · 拉曼峰分析 · 矿物鉴定（中英双语，Windows 绿色版）
 
