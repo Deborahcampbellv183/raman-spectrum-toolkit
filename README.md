@@ -27,12 +27,13 @@
 | 类别 | 能做什么 |
 | --- | --- |
 | **格式转换** | `.jws`/CSV/SPC/JCAMP-DX/TXT → CSV、**带图的 Excel**、PNG 曲线图、峰列表、JCAMP-DX |
-| **峰分析** | 自动找峰并标注峰位、手动补标、高斯/洛伦兹/伪 Voigt 峰拟合、峰位检索 |
+| **峰分析** | 自动找峰并标注峰位（**峰位带波长虚线**）、**标错的峰连同自动峰一起右键删除、可一键恢复**、手动补标、高斯/洛伦兹/伪 Voigt 峰拟合、峰位检索；峰位数值可一键隐藏 |
 | **未知谱鉴定** | 不知道样品是什么？拿它的峰去整个参考库比对，按可信度给出候选矿物 + 峰位对照 |
 | **参考谱库** | 在线检索 ROD、按矿物批量抓取 RRUFF 数据包（拉曼 / 红外 / XRD / 化学成分），导出为本地库 |
 | **配对比较** | 实测谱 ↔ 标准谱手动/自动配对，输出峰位匹配 F1、相关系数、谱角与对照报告图 |
 | **预处理** | 尖峰（宇宙射线）去除、基线校正、平滑、导数、归一化、拉曼位移校准 |
 | **统计分析** | 层次聚类 + PCA、二维成像热图、平均/相减、谱段替换、交互式 A−k·B 找平 |
+| **多谱对照** | **瀑布图**（纵向错开，看有哪些峰）+ **多数据图叠加**（同轴叠画、**每条数据集一种颜色**、横坐标自动取各条的**交集**、可隐藏峰位数值、导出 PNG） |
 | **批量与报告** | 整目录批处理 + 汇总表、自包含 HTML 分析报告（图片内嵌，可打印成 PDF） |
 
 <table>
@@ -41,10 +42,18 @@
 <td width="50%"><img src="docs/example_pairing.png" alt="配对对比报告"></td>
 </tr>
 <tr>
-<td align="center"><sub>自动识别并标注峰位（锆石参考谱，785 nm）</sub></td>
+<td align="center"><sub>自动识别并标注峰位，每个峰用虚线引到横坐标轴（锆石参考谱，785 nm）</sub></td>
 <td align="center"><sub>未知谱 ↔ 库中标准谱配对报告（峰位匹配 F1 排序）</sub></td>
 </tr>
 </table>
+
+<div align="center">
+
+<img src="docs/example_overlay.png" alt="多数据图叠加">
+
+<sub><b>多数据图叠加</b> — 4 条光谱叠画在同一套坐标轴上，每条数据集一种颜色（默认各条归一化到最大值 = 1），一键导出 PNG</sub>
+
+</div>
 
 ## 快速开始
 
@@ -77,6 +86,8 @@ python jws2csv.py --rruff-fetch Zircon       # 一键下载 + 检索 + 导出锆
 python jws2csv.py --mineral-info Zircon      # 矿物信息卡（特征峰归属 + RRUFF 样品记录）
 python jws2csv.py --cluster 文件夹           # 聚类分析 + 主成分
 python jws2csv.py --map 5,5 --map-metric main_peak   # 二维成像热图
+python jws2csv.py --waterfall 文件夹         # 瀑布图（纵向错开）
+python jws2csv.py --overlay 文件夹           # 多数据图叠加（每条一色，导出 PNG）
 python jws2csv.py --report 文件夹            # 自包含 HTML 分析报告
 python jws2csv.py --lang en|zh               # 切换界面/输出语言
 python jws2csv.py --manual                   # 打印完整说明书
@@ -134,12 +145,13 @@ The GUI, CLI, reports and manuals are **fully bilingual (Chinese / English)**.
 | Area | Capability |
 | --- | --- |
 | **Conversion** | `.jws` / CSV / SPC / JCAMP-DX / TXT → CSV, **Excel with embedded chart**, PNG plot, peak table, JCAMP-DX |
-| **Peak analysis** | automatic peak detection with position labels, manual peak annotation, Gaussian / Lorentzian / pseudo-Voigt fitting, peak-position search |
+| **Peak analysis** | automatic peak detection with position labels (**each peak gets a dashed line down to the x axis**), **right-click to delete a wrong peak — automatic ones included — and restore them all with one click**, manual annotation, Gaussian / Lorentzian / pseudo-Voigt fitting, peak-position search; peak values can be hidden |
 | **Unknown spectra** | identify a spectrum whose mineral you do not know by matching its peaks against a whole reference library, with confidence ranking and a peak-by-peak comparison |
 | **Reference libraries** | search ROD online, bulk-fetch RRUFF packages (Raman / IR / XRD / chemistry), export them into a local library |
 | **Pairing** | measured ↔ reference pairing (manual or automatic) with peak-match F1, correlation, spectral angle, and a comparison report figure |
 | **Preprocessing** | spike (cosmic ray) removal, baseline correction, smoothing, derivative, normalization, Raman shift calibration |
 | **Statistics** | hierarchical clustering + PCA, 2D imaging heat map, average / subtract, range replacement, interactive A−k·B flattening |
+| **Multi-spectrum comparison** | **waterfall** (offset stacks, to see *which* peaks are there) + **multi-dataset overlay** (shared axes, **one colour per dataset**, x axis automatically the **intersection** of all ranges, peak values can be hidden, exportable as PNG) |
 | **Batch & reports** | whole-folder batch conversion with a summary table, self-contained HTML report (images embedded, printable to PDF) |
 
 ### Quick start
@@ -165,6 +177,8 @@ python jws2csv.py
 python jws2csv.py --identify unknown.csv    # identify an unknown spectrum
 python jws2csv.py --pair unknown.csv        # pair against your local library
 python jws2csv.py --rruff-fetch Zircon      # download + index + export Zircon references
+python jws2csv.py --waterfall folder        # waterfall chart (offset stacks)
+python jws2csv.py --overlay folder          # multi-dataset overlay, one colour each
 python jws2csv.py --report folder           # self-contained HTML analysis report
 python jws2csv.py --lang en|zh              # switch UI / output language
 python jws2csv.py --manual                  # print the full user guide

@@ -20,6 +20,7 @@ RamanSpectrumToolkit*.zip
 
 # 本地自测与临时文件
 _tmp_*
+_commit_msg.txt
 _verify*/
 _pkg/
 assets/_shot*.png

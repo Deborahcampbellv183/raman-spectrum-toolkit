@@ -14,7 +14,7 @@ ALLOW = ("工具数据", "参考谱库", "RRUFF数据包", "分析结果", "光�
          "转换结果", "批处理汇总", "未知光谱检索", "配对报告", "分析报告",
          "主峰", "光谱转换", "使用说明", "光谱分析报告", "报告图",
          "相似度矩阵", "平均光谱", "相减_A减", "数据库比对", "启动转换工具",
-         "启动拉曼光谱工具", "拉曼光谱工具")
+         "启动拉曼光谱工具", "拉曼光谱工具", "叠加图")
 PATH_RX = re.compile(r"[A-Za-z]:\\[^\s\"'|]*")
 
 d = os.path.join(tempfile.gettempdir(), "_en_cli")
@@ -80,7 +80,19 @@ run("--report", ["--report", d, "--out", d])
 run("--batch", ["--batch", d, "--out", d])
 run("--pair", ["--pair", csv1])
 run("--db-match", ["--db-match", csv1])
+run("--overlay", ["--overlay", d, "--out", d])
+run("--no-peak-dash", ["--png", "--no-peak-dash", "--no-peak-labels", "--out", d, csv1])
 run("--cache-limit", ["--cache-limit"])
+
+# 命令行子进程会把 --lang 写进 ini，这里清掉，避免自测污染用户设置
+try:
+    sys.path.insert(0, ROOT)
+    import jws2csv as _T
+    _s = _T._load_settings()
+    _s.pop("lang", None)
+    _T._save_settings(_s)
+except Exception:
+    pass
 
 print()
 print("英文命令行自测：通过 %d 项，失败 %d 项" % (ok[0], ok[1]))

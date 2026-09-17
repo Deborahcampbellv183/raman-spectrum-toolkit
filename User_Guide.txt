@@ -1,6 +1,6 @@
 ﻿Raman Spectrum Toolkit  User Guide
 (JASCO .jws conversion - Raman peak analysis - mineral identification)
-(guide version: 2.0)
+(guide version: 2.1)
 ============================================================
 
 In one sentence:
@@ -72,10 +72,18 @@ Why does the CSV I double-clicked in WPS show only numbers, no chart?
   is missing the tool tells you how to install it (pip install openpyxl).
 
 Peaks were missed
-  Right-click behaviour: left-click on the chart adds a peak manually (blue
-  square), right-click removes the nearest manual peak. Manual peaks are
+  Left-click on the chart adds a peak manually (blue square). Manual peaks are
   remembered per file and appear in the peak list with source "manual".
   You can also lower the peak sensitivity threshold in [Advanced settings...].
+
+Peaks were detected that should not be there
+  Right-click on the peak to delete it - this works for automatic peaks (red
+  dots) as well as manual ones. A deleted automatic peak goes onto a per-file
+  "deleted" list and is left out of the chart, the peak table and every export.
+  Click near the peak (about +-1/40 of the chart width) or the tool will only
+  report that no peak is nearby, so right-clicking on empty space never deletes
+  anything. [Restore auto peaks] (also under [Settings]) brings them all back,
+  and the list is per file, so nothing is unrecoverable.
 
 ============================================================
 2. Interface overview
@@ -94,7 +102,8 @@ Left side
 
 Right side
   [Chart settings]   X tick interval (integer, 200 by default), start tick,
-                     hide Y values, grid lines, title, figure size
+                     hide Y values, grid lines, title, figure size, show peak
+                     values, undo / clear manual peaks, restore auto peaks
   Spectrum preview   up to 8 curves overlaid, [Clear view]
   [Save preview as PNG]  saves the current view
 
@@ -103,9 +112,10 @@ Menu bar
   Analysis  unknown-spectrum search (whole-library identification), peak
             fitting, compare, peak-position search, similarity matrix,
             clustering, 2D imaging, average, subtract, range replacement,
-            waterfall, spectrum comparison
+            waterfall, multi-dataset overlay, spectrum comparison
   Settings  advanced settings..., mineral info and Raman peak assignment...,
-            data folder..., language
+            data folder..., clear manual peak annotations, restore deleted
+            automatic peaks, language
   Database  search online databases (ROD / RRUFF)..., RRUFF data sources...,
             open data folders
   Help      guide (full manual)..., export the guide as TXT..., about
@@ -210,13 +220,37 @@ The [Chart settings] panel on the right refreshes the preview immediately:
   Figure size       PNG pixels, 1600x900 by default
   Peak labels       label every detected peak; optionally show relative
                     intensity (%) next to the wavenumber
+  Show peak values  on by default; untick it and the wavenumber numbers are no
+                    longer drawn while the markers and dashed lines stay - handy
+                    when many curves are on the chart
+
+Peak wavelength dashed lines
+  Every annotated peak - detected automatically or added by hand - also gets a
+  dashed line from the peak top straight down to the x axis, so the wavenumber
+  of the peak can be read off at a glance. To hide them, untick "draw a dashed
+  line from each peak down to the x axis (auto + manual peaks)" under
+  [Settings -> Advanced settings...] -> "Peak detection and fitting"
+  (command line: --no-peak-dash).
 
 Manual annotation
   Left-click the chart   add a peak at the nearest peak top (blue square)
-  Right-click            remove the nearest manual peak
+  [Undo manual peak]     remove the last one you added
   [Clear manual peaks]   remove them all for the current file
-  [Undo manual peak]     remove the last one
   Manual peaks are kept per file and are marked "manual" in the peak list.
+
+Deleting peaks you do not want (including wrong automatic ones)
+  Right-click on a peak deletes the annotated peak nearest to the pointer -
+  both automatic peaks (red dots) and manual ones (blue squares).
+  An automatic peak is not really "gone": its position goes onto a per-file
+  "deleted" list, and the chart, the peak table and every export are then
+  computed without it. You must click near the peak (about +-1/40 of the chart
+  width); otherwise the tool just says no peak is nearby, so that a stray
+  right-click on empty space cannot delete anything.
+  [Restore auto peaks] puts every deleted automatic peak of that file back
+  (same as [Settings -> Restore deleted automatic peaks]).
+  A deleted manual peak is removed for real - add it back with a left-click or
+  use [Undo manual peak].
+  The lists are per file, so a mistake is always undoable.
 
 When a peak sits on a shoulder, the tool estimates its prominence against a
 local baseline so that the annotation and the table stay sensible.
@@ -427,6 +461,31 @@ All in the [Analysis] menu.
                                spectrum with the matching range of another
                                spectrum, with a linear transition at the edges
   Waterfall                    many spectra stacked with a vertical offset
+  Multi-dataset overlay        [Analysis -> Multi-dataset overlay (selected
+                               spectra)...] or --overlay on the command line.
+                               No vertical offset: every dataset is drawn on the
+                               same axes, one colour per dataset, so you compare
+                               spectral shapes rather than peak lists.
+                                 . the x axis uses the INTERSECTION of every
+                                   dataset's wavenumber range, so a shorter
+                                   spectrum does not leave a blank strip on the
+                                   right; the dialog states the range it used.
+                                   An explicit range in [Advanced settings...]
+                                   still wins.
+                                 . each curve is normalized to max = 1 by
+                                   default; untick it to keep raw intensities
+                                   and compare real relative strengths
+                                 . peak annotation is optional; when enabled,
+                                   every peak gets a dashed line down to the
+                                   x axis
+                                 . untick "show peak values" to drop the
+                                   numbers and keep only the dashed lines and
+                                   markers - much clearer with a dozen curves
+                                   (the main panel's "Show peak values" does
+                                   the same)
+                                 . the legend names the source file of each
+                                   curve (first 12 at most)
+                               Exported as 叠加图_N条.png into the results folder.
   Compare with a reference     compare one spectrum with a single reference
   Pairing with the local library  compare against every spectrum in 参考谱库
 
@@ -484,7 +543,9 @@ Analysis report
                     pairs; the second pair is only needed for two-point scaling)
   Peaks             sensitivity threshold (% of the intensity range, smaller is
                     more sensitive), minimum separation (cm-1), peak shape for
-                    fitting, assignment reference mineral
+                    fitting, assignment reference mineral, "show relative
+                    intensity with peak labels", "draw a dashed line from each
+                    peak down to the x axis (auto + manual peaks)"
   Figure size       PNG pixels
 
   "Also apply to exported data" decides whether preprocessing is written into
@@ -502,12 +563,15 @@ Conversion
   jws2csv.py folder --png --peaks       whole folder, PNG + peak list
   jws2csv.py --xlsx --out D:\out a.jws  Excel with chart into a folder
   jws2csv.py --skip-existing            never overwrite existing CSV
+  jws2csv.py --waterfall folder         stacked waterfall chart
+  jws2csv.py --overlay folder           overlaid chart, one colour per dataset
 
 Processing (same names as the advanced settings)
   --despike --baseline iterative --order 5 --iters 20
   --smooth sg --window 7 --savgol-order 2
   --deriv 1 --norm max --calib 520.6:520.7
   --x-min 100 --x-max 2000 --tick 200 --fig-w 1600 --fig-h 900
+  --no-peaks --no-peak-dash --no-peak-labels
   --header-custom "Wavenumber,Intensity"
 
 Analysis

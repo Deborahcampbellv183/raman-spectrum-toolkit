@@ -192,6 +192,7 @@ def fake_mainloop(self):
         ("二维成像", lambda: app.tool_map()),
         ("谱段替换", lambda: app.tool_replace()),
         ("交互式相减", lambda: app.tool_subtract_interactive()),
+        ("多数据图叠加", lambda: app.tool_overlay()),
     ]
     actions = [
         ("配对比较", lambda: app.tool_pair_manual()),
@@ -242,6 +243,103 @@ def fake_mainloop(self):
         residue[name] = bad
         check("%s 日志无中文残留" % name, not bad,
               "残留 %d 处：%s" % (len(bad), bad[:4]))
+
+    # 多数据图叠加：打开对话框 → 点“生成并导出” → 确认 PNG 真的落盘
+    before = {id(w) for w in app.winfo_children() if isinstance(w, tk.Toplevel)}
+    app.log.configure(state="normal")
+    app.log.delete("1.0", "end")
+    app.log.configure(state="disabled")
+    try:
+        app.tool_overlay()
+        app.update()
+        new = [w for w in app.winfo_children()
+               if isinstance(w, tk.Toplevel) and id(w) not in before]
+        if not new:
+            check("叠加图对话框 打开", False, "没有新窗口")
+        else:
+            dlg = new[-1]
+            dlg.update()
+            btns = [w for w in collect(dlg) if w.winfo_class() == "TButton"]
+            labels = [str(w.cget("text")) for w in btns]
+            hit = [w for w in btns if str(w.cget("text")) == "Render and export"]
+            check("叠加图对话框有导出按钮", bool(hit), str(labels))
+            if hit:
+                hit[0].invoke()
+                app.update()
+            app.log.configure(state="normal")
+            lines = app.log.get("1.0", "end").splitlines()
+            app.log.configure(state="disabled")
+            names = [ln.split(":", 1)[1].strip() for ln in lines
+                     if ln.strip().startswith("Overlay:") and ":" in ln]
+            path = os.path.join(T.results_dir(), names[-1]) if names else ""
+            check("叠加图已导出 PNG",
+                  bool(path) and os.path.isfile(path) and os.path.getsize(path) > 10000,
+                  path)
+    except Exception as exc:
+        check("叠加图导出", False, repr(exc)[:90])
+    for w in [x for x in app.winfo_children() if isinstance(x, tk.Toplevel)]:
+        if id(w) not in before:
+            w.destroy()
+    app.update()
+
+    # 右键删除自动峰 → 恢复自动峰（界面记账是否正确）
+    try:
+        app.listbox.selection_clear(0, "end")
+        app.listbox.selection_set(0)
+        app.update()
+        app.preview_selected()
+        app.update()
+        v = app._view
+        key = app._peak_key(app.files[0])
+        xs = app._view_series[0][1]
+        ys = app._view_series[0][2]
+        before_pk = T.analyze_peaks(xs, ys, app.current_plot_options(), processed=True)
+
+        class _E(object):
+            pass
+
+        def _at(data_x):
+            ev = _E()
+            ev.x = int(v["ml"] + (data_x - v["xmin"]) / (v["xmax"] - v["xmin"]) * v["pw"])
+            ev.y = int(v["mt"] + v["ph"] * 0.3)
+            return ev
+
+        auto = [q for q in before_pk if not q.get("manual")]
+        hit = max(auto, key=lambda q: q["prominence"])
+        app.hidden_peaks.pop(key, None)
+        app.remove_annotated_peak(_at(hit["x"]))
+        app.update()
+        hidden = list(app.hidden_peaks.get(key, []))
+        check("右键删掉一个自动峰", len(hidden) == 1, str(hidden))
+        after_pk = T.analyze_peaks(xs, app._view_series[0][2],
+                                   app.current_plot_options(), processed=True)
+        check("删掉的峰从峰表消失", len(after_pk) == len(before_pk) - 1,
+              "%d -> %d" % (len(before_pk), len(after_pk)))
+
+        # 空白处右键不能误删
+        span = v["xmax"] - v["xmin"]
+        far_x = None
+        for frac in (0.02, 0.05, 0.95, 0.98):
+            cand = v["xmin"] + span * frac
+            if all(abs(cand - q["x"]) > span / 20.0 for q in after_pk):
+                far_x = cand
+                break
+        if far_x is not None:
+            app.remove_annotated_peak(_at(far_x))
+            app.update()
+            check("空白处右键不会误删",
+                  len(app.hidden_peaks.get(key, [])) == 1,
+                  str(app.hidden_peaks.get(key, [])))
+
+        app.restore_hidden_peaks()
+        app.update()
+        check("恢复自动峰后名单清空", not app.hidden_peaks.get(key), "")
+        restored = T.analyze_peaks(xs, app._view_series[0][2],
+                                   app.current_plot_options(), processed=True)
+        check("恢复后峰表还原", len(restored) == len(before_pk),
+              "%d / %d" % (len(restored), len(before_pk)))
+    except Exception as exc:
+        check("右键删除 / 恢复自动峰", False, repr(exc)[:90])
 
     # 关于框走 messagebox，单独抓文本检查
     cap = {}

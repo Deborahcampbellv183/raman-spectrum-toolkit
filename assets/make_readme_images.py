@@ -3,10 +3,10 @@
 import os
 import sys
 
-sys.path.insert(0, r"f:\csv")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 import jws2csv as T
 
-ROOT = r"f:\csv"
 OUT = os.path.join(ROOT, "docs")
 os.makedirs(OUT, exist_ok=True)
 LIB = os.path.join(ROOT, "工具数据", "参考谱库")
@@ -38,3 +38,20 @@ if results:
     print("example_pairing.png ok, best =", results[0]["name"])
 else:
     print("pairing produced no results")
+
+# 3) 多数据图叠加：几种矿物的参考谱叠在同一套坐标轴上，每条一色
+WANT = ("Zircon_R050034_785nm.csv", "Hematite_1000001_514nm.csv",
+        "Gypsum_3500028_514nm.csv", "Dolomite_1000016_514nm.csv")
+ov = []
+for name in WANT:
+    q = os.path.join(LIB, name)
+    if not os.path.isfile(q):
+        continue
+    _l2, s2 = T.read_any_series(q)
+    ov.append((name[:-4].replace("_", " "), list(s2[0][1]), list(s2[0][2])))
+po = T._plot_opts({"x_step": 200})
+po["annotate_peaks"] = False
+T.render_overlay(os.path.join(OUT, "example_overlay.png"), ov,
+                 "Multi-dataset overlay  -  reference spectra, one colour each",
+                 T._DEFAULT_X_HEADER, "Normalized intensity", po)
+print("example_overlay.png ok,", len(ov), "curves ->", [c[0] for c in ov])

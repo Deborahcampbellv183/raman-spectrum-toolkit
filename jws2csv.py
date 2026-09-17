@@ -88,6 +88,7 @@
 """
 
 import base64
+import colorsys
 import json
 import math
 import os
@@ -145,6 +146,8 @@ _PLOT_DEFAULT = {
     "peak_min_dist": 20.0,
     "peak_thresh_pct": 7.0,
     "peak_label_rel": False,
+    "peak_dash_line": True,
+    "peak_labels": True,
     "smooth_window": 1,
     "smooth_mode": "mean",
     "despike": False,
@@ -163,6 +166,7 @@ _PLOT_DEFAULT = {
     "fig_width": 1600,
     "fig_height": 900,
     "manual_peaks": None,
+    "hidden_peaks": None,
     "mineral_name": None,
     "stack_offset": 0.75,
 }
@@ -1140,6 +1144,13 @@ def analyze_peaks(xs, ys, plot=None, processed=False):
     peaks = find_peaks(xs, sig, p["peak_min_dist"], thresh_pct=p["peak_thresh_pct"])
     for pk in peaks:
         pk["manual"] = False
+    # 用户删掉的自动峰：按峰位抹掉。容差取“最小峰间距”的一半，与手动峰
+    # 合并的判据一致 —— 该间距下自动峰之间至少隔这么远，只可能命中一个。
+    hidden = p.get("hidden_peaks") or []
+    if hidden:
+        tol = max(1.0, abs(float(p["peak_min_dist"])) / 2.0)
+        peaks = [pk for pk in peaks
+                 if not any(abs(pk["x"] - float(hv)) <= tol for hv in hidden)]
     manual = p.get("manual_peaks") or []
     if manual:
         dup = max(1.0, abs(float(p["peak_min_dist"])) / 2.0)
@@ -1602,6 +1613,32 @@ def _png_text(draw, font, xy, text, anchor, fill=(70, 70, 70)):
         draw.text(xy, text, font=font, fill=fill)
 
 
+def _png_dashed_v(draw, x, y_from, y_to, color, dash=7, gap=5, width=1):
+    """在 x 处画一条 y_from → y_to 的竖直虚线，用来把峰位波长引到横坐标轴上。"""
+    lo, hi = (y_from, y_to) if y_from <= y_to else (y_to, y_from)
+    y = lo
+    while y < hi:
+        ye = min(y + dash, hi)
+        draw.line([(x, y), (x, ye)], fill=color, width=width)
+        y = ye + gap
+
+
+def overlay_color(k):
+    """叠加图配色：前 8 条用标准色板，之后按黄金角旋转色相生成新色，保证彼此可区分。"""
+    n = len(_PALETTE)
+    if k < n:
+        return _PALETTE[k]
+    hexs = _PALETTE[k % n].lstrip("#")
+    r, g, b = (int(hexs[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    h, _l, _s = colorsys.rgb_to_hls(r, g, b)
+    rounds = k // n
+    hue = (h + 0.6180339887498949 * rounds) % 1.0
+    sat = 0.48 + 0.22 * (rounds % 2)
+    lig = (0.64, 0.42, 0.32, 0.55)[rounds % 4]
+    r2, g2, b2 = colorsys.hls_to_rgb(hue, lig, sat)
+    return "#%02x%02x%02x" % (int(r2 * 255), int(g2 * 255), int(b2 * 255))
+
+
 def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, height=None):
     if not _HAVE_PIL:
         raise JwsError(T("导出 PNG 需要 Pillow 组件（pip install pillow）"))
@@ -1699,16 +1736,19 @@ def render_png(path, series, title, xlabel, ylabel, plot=None, width=None, heigh
                     continue
                 gx = sx(pk["x"])
                 gy = sy(pk["y"])
+                mark_color = (20, 80, 170) if pk.get("manual") else (170, 30, 30)
+                # 峰位波长虚线：从峰顶一直引到横坐标轴（自动峰和手动峰一视同仁）
+                if p["peak_dash_line"]:
+                    _png_dashed_v(d, gx, gy, mt + ph, mark_color)
                 if pk.get("manual"):
                     d.rectangle([gx - 4, gy - 4, gx + 4, gy + 4], fill=(30, 110, 200))
-                    mark_color = (20, 80, 170)
                 else:
                     d.ellipse([gx - 3, gy - 3, gx + 3, gy + 3], fill=(200, 40, 40))
-                    mark_color = (170, 30, 30)
                 text = ("%g  %.0f%%" % (round(pk["x"], 1), pk["rel"])
                         if p["peak_label_rel"] else "%g" % round(pk["x"], 1))
                 ly = gy - (12, 32, 52)[k % 3]
-                _png_text(d, f_tick, (gx, ly), text, "mb", fill=mark_color)
+                if p["peak_labels"]:
+                    _png_text(d, f_tick, (gx, ly), text, "mb", fill=mark_color)
 
     if title and p["show_title"]:
         _png_text(d, f_title, (ml + pw / 2, mt - 55), title, "ma", fill=(30, 30, 30))
@@ -2215,6 +2255,49 @@ def render_waterfall(path, series, title="", xlabel="", ylabel="", plot=None, wi
                   "y_min": None, "y_max": None})
     local.pop("manual_peaks", None)
     render_png(path, stacked, title, xlabel, ylabel, local, width, height)
+
+
+def render_overlay(path, series, title="", xlabel="", ylabel="", plot=None,
+                   width=None, height=None, normalize=True, common_range=True):
+    """多数据图叠加：每个数据集一种颜色，全部画在同一套坐标轴上，不做纵向偏移。
+
+    与瀑布图的区别：瀑布图把各条上下错开，看的是“有哪些峰”；
+    叠加图把各条压在同一基线上比形状，看的是“谱型像不像”。
+
+    common_range=True 时，横坐标取所有数据图波数范围的**交集**：
+    只比较大家都有数据的波段，避免某条谱短一截时右边空出一段白。
+    """
+    data = [(lab, xs, ys) for lab, xs, ys in series if len(xs) > 1 and len(ys) > 1]
+    if not data:
+        raise JwsError(T("没有可绘制的数据"))
+    local = dict(plot or {})
+    if normalize:
+        local["normalize"] = "max"
+    if common_range:
+        lo, hi = overlay_range(data)
+        if lo is not None and hi is not None and hi > lo:
+            # 高级设置里手动填过范围就以手动为准
+            if local.get("x_min") is None:
+                local["x_min"] = lo
+            if local.get("x_max") is None:
+                local["x_max"] = hi
+    colored = [(lab, xs, ys, overlay_color(k)) for k, (lab, xs, ys) in enumerate(data)]
+    render_png(path, colored, title, xlabel, ylabel, local, width, height)
+
+
+def overlay_range(series):
+    """返回叠加时共用的横坐标范围 (lo, hi)：各数据图波数范围的交集。
+
+    各条完全不相交时交集为空，退回并集，避免画出一张空白图。
+    """
+    xs_list = [xs for _l, xs, ys in series if len(xs) > 1 and len(ys) > 1]
+    if not xs_list:
+        return None, None
+    lo = max(min(xs) for xs in xs_list)
+    hi = min(max(xs) for xs in xs_list)
+    if hi <= lo:
+        return min(min(xs) for xs in xs_list), max(max(xs) for xs in xs_list)
+    return lo, hi
 
 
 def _write_png(dst, spec, names, plot=None):
@@ -5349,6 +5432,8 @@ def _cli(args):
             formats.add("jcamp")
         elif low == "--waterfall":
             formats.add("waterfall")
+        elif low in ("--overlay", "--stack-overlay"):
+            formats.add("overlay")
         elif low == "--both":
             formats.update(("csv", "xlsx"))
         elif low == "--all":
@@ -5469,6 +5554,10 @@ def _cli(args):
             plot["show_title"] = False
         elif low == "--no-peaks":
             plot["annotate_peaks"] = False
+        elif low == "--no-peak-dash":
+            plot["peak_dash_line"] = False
+        elif low in ("--no-peak-labels", "--no-peak-numbers"):
+            plot["peak_labels"] = False
         elif low == "--normalize":
             if i + 1 < len(args):
                 plot["normalize"] = args[i + 1].strip().lower()
@@ -6096,7 +6185,8 @@ def _cli(args):
     if not formats:
         formats = {"csv"}
     want_waterfall = "waterfall" in formats
-    formats = set(f for f in formats if f != "waterfall")
+    want_overlay = "overlay" in formats
+    formats = set(f for f in formats if f not in ("waterfall", "overlay"))
     out_dir_arg = out_arg
     if out_dir_arg:
         os.makedirs(out_dir_arg, exist_ok=True)
@@ -6157,7 +6247,7 @@ def _cli(args):
                 dst = os.path.join(out_dir_arg or results_dir(),
                                    "瀑布图_%d条.png" % len(spectra))
                 render_waterfall(dst, spectra, "瀑布图（%d 条）" % len(spectra),
-                                 _DEFAULT_X_HEADER, "归一化强度", plot,
+                                 _DEFAULT_X_HEADER, T("归一化强度"), plot,
                                  offset=p["stack_offset"])
                 print(T("瀑布图：%s") % dst)
             except Exception as exc:
@@ -6165,6 +6255,20 @@ def _cli(args):
                 fail += 1
         else:
             print(T("瀑布图至少需要 2 条光谱，已跳过。"))
+    if want_overlay:
+        spectra = collect_spectra(files, plot, verbose=False)
+        if len(spectra) >= 2:
+            try:
+                dst = os.path.join(out_dir_arg or results_dir(),
+                                   "叠加图_%d条.png" % len(spectra))
+                render_overlay(dst, spectra, "叠加图（%d 条）" % len(spectra),
+                               _DEFAULT_X_HEADER, "归一化强度", plot)
+                print(T("叠加图：%s") % dst)
+            except Exception as exc:
+                print(T("ERR 叠加图 -> %s") % exc)
+                fail += 1
+        else:
+            print(T("叠加图至少需要 2 条光谱，已跳过。"))
     print("\n" + T("完成：成功 %d 个，跳过 %d 个，失败 %d 个") % (ok, skip, fail))
     return 0 if fail == 0 else 1
 
@@ -6255,11 +6359,13 @@ def _run_gui():
                 "normalize": "none", "apply_to_data": False,
                 "calib_a": None, "calib_b": None, "calib_a2": None, "calib_b2": None,
                 "peak_thresh_pct": 7.0, "peak_label_rel": False,
+                "peak_dash_line": True,
                 "fit_shape": "voigt",
                 "fig_width": 1600, "fig_height": 900,
                 "mineral_name": None, "stack_offset": 0.75,
             }
             self.manual_peaks = {}
+            self.hidden_peaks = {}
             self._view = None
             self._view_series = None
             self._build_style()
@@ -6300,7 +6406,7 @@ def _run_gui():
             self._toggle_dir()
             self._toggle_header()
             self._log(T("① 可读：.jws / .csv / .spc / .jdx / .txt / .xlsx；可出 Excel(图表) / PNG / CSV / 峰列表 / 峰拟合 / JCAMP-DX。"))
-            self._log(T("② 漏标的峰：在右侧图上左键点击即可手动补标（蓝色方块），右键删除。"))
+            self._log(T("② 漏标的峰：在右侧图上左键点击即可手动补标（蓝色方块）；标错的峰（含自动峰）对准它右键即可删掉。"))
             self._log(T("③ 菜单“分析工具”：未知光谱检索（全库鉴定）/ 峰拟合 / 比对 / 峰位检索 /"))
             self._log(T("   相似度矩阵 / 平均 / 相减 / 谱段替换 / A−k·B / 瀑布图 / 聚类 / 二维成像。"))
             self._log(T("④ 菜单“文件”：文件夹批处理、导出分析报告；菜单“设置”：高级设置（含尖峰去除、"))
@@ -6353,6 +6459,7 @@ def _run_gui():
             tm.add_separator()
             tm.add_command(label="谱段替换 / 拼接…", command=self.tool_replace)
             tm.add_command(label="瀑布图（所选光谱）", command=self.tool_waterfall)
+            tm.add_command(label="多数据图叠加（所选光谱）…", command=self.tool_overlay)
             tm.add_separator()
             tm.add_command(label="光谱比对（参考谱文件）…", command=self.tool_match)
             bar.add_cascade(label="分析工具", menu=tm)
@@ -6365,6 +6472,7 @@ def _run_gui():
             sm.add_command(label="数据文件夹…（位置 / 占用 / 容量上限 / 清理）",
                            command=self.open_data_manager)
             sm.add_command(label="清空手动峰标注", command=self.clear_manual_peaks)
+            sm.add_command(label="恢复被删的自动峰", command=self.restore_hidden_peaks)
             bar.add_cascade(label="设置", menu=sm)
 
             dm = tk.Menu(bar, tearoff=0)
@@ -6696,6 +6804,7 @@ def _run_gui():
             self.show_grid = tk.BooleanVar(value=True)
             self.show_title = tk.BooleanVar(value=True)
             self.annotate_peaks = tk.BooleanVar(value=True)
+            self.peak_labels = tk.BooleanVar(value=True)
             self.peakdist_var = tk.StringVar(value="20")
             ttk.Checkbutton(setf, text="显示纵坐标数值", variable=self.show_y_ticks,
                             command=self._refresh_preview).grid(row=1, column=0, columnspan=2,
@@ -6715,12 +6824,17 @@ def _run_gui():
                                                                         pady=(0, 6))
             ttk.Button(setf, text="高级设置…", command=self.open_advanced).grid(
                 row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+            ttk.Checkbutton(setf, text="显示峰位数值", variable=self.peak_labels,
+                            command=self._refresh_preview).grid(
+                row=3, column=2, columnspan=3, sticky="w", padx=6, pady=(0, 4))
             ttk.Button(setf, text="撤销手动峰", command=lambda: self.remove_manual_peak(None)
                        ).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 6))
             ttk.Button(setf, text="清空手动峰", command=self.clear_manual_peaks).grid(
                 row=4, column=1, sticky="w", padx=4, pady=(0, 6))
-            ttk.Label(setf, text="左键点图=补标峰，右键=删除最近手动峰",
-                      foreground="#888").grid(row=4, column=2, columnspan=3, sticky="w",
+            ttk.Button(setf, text="恢复自动峰", command=self.restore_hidden_peaks).grid(
+                row=4, column=2, sticky="w", padx=4, pady=(0, 6))
+            ttk.Label(setf, text="左键点图=补标峰，右键=删掉最近的峰（自动 / 手动都可）",
+                      foreground="#888").grid(row=5, column=0, columnspan=5, sticky="w",
                                               padx=6, pady=(0, 6))
             for var in (self.xstep_var, self.xstart_var, self.peakdist_var):
                 var.trace_add("write", lambda *a: self._refresh_preview())
@@ -6730,7 +6844,7 @@ def _run_gui():
             self.canvas.pack(fill="both", expand=True, padx=8, pady=(4, 8))
             self.canvas.bind("<Configure>", self._on_canvas_resize)
             self.canvas.bind("<Button-1>", self.add_manual_peak)
-            self.canvas.bind("<Button-3>", self.remove_manual_peak)
+            self.canvas.bind("<Button-3>", self.remove_annotated_peak)
             self._draw(None, "", "")
 
         def _toggle_dir(self):
@@ -6762,6 +6876,7 @@ def _run_gui():
                 "show_grid": self.show_grid.get(),
                 "show_title": self.show_title.get(),
                 "annotate_peaks": self.annotate_peaks.get(),
+                "peak_labels": self.peak_labels.get(),
                 "peak_min_dist": num(self.peakdist_var.get(), 20.0),
             }
             opts.update(self.adv_values)
@@ -6777,15 +6892,37 @@ def _run_gui():
             opts = self.plot_options()
             sel = self.listbox.curselection()
             if len(sel) == 1:
-                opts["manual_peaks"] = list(self.manual_peaks.get(self.files[sel[0]], []))
+                opts.update(self._peak_overrides(self.files[sel[0]]))
             return opts
+
+        def _peak_key(self, path):
+            """手动峰 / 被删自动峰按文件记录，键统一成绝对路径，避免同一个文件对不上。"""
+            return os.path.abspath(path)
+
+        def _peak_overrides(self, path):
+            """某个文件上“手动补的峰 + 被删掉的自动峰”，打包成 plot 覆盖项。"""
+            out = {}
+            manual = self.manual_peaks.get(self._peak_key(path))
+            if manual:
+                out["manual_peaks"] = list(manual)
+            hidden = self.hidden_peaks.get(self._peak_key(path))
+            if hidden:
+                out["hidden_peaks"] = list(hidden)
+            return out
 
         def _manual_list(self):
             sel = self.listbox.curselection()
             if len(sel) != 1:
                 return None, None
-            path = self.files[sel[0]]
+            path = self._peak_key(self.files[sel[0]])
             return path, self.manual_peaks.setdefault(path, [])
+
+        def _hidden_list(self):
+            sel = self.listbox.curselection()
+            if len(sel) != 1:
+                return None, None
+            path = self._peak_key(self.files[sel[0]])
+            return path, self.hidden_peaks.setdefault(path, [])
 
         def add_manual_peak(self, event=None):
             path, lst = self._manual_list()
@@ -6826,19 +6963,69 @@ def _run_gui():
             self._log(T("手动标注峰：%.2f（共 %d 个）") % (px, len(lst)))
 
         def remove_manual_peak(self, event=None):
+            """撤销最后补的一个手动峰（工具栏按钮用）。"""
             path, lst = self._manual_list()
             if lst is None or not lst:
                 return
-            if event is not None and self._view and self._view_series:
-                v = self._view
-                xs = self._view_series[0][1]
-                data_x = v["xmin"] + (event.x - v["ml"]) / v["pw"] * (v["xmax"] - v["xmin"])
-                near = min(lst, key=lambda q: abs(q - data_x))
-                lst.remove(near)
-            else:
-                lst.pop()
+            lst.pop()
             self.preview_selected()
             self._log(T("已移除手动峰，剩余 %d 个。") % len(lst))
+
+        def remove_annotated_peak(self, event=None):
+            """右键图上的峰：手动峰直接删掉，自动峰记进“已删除”名单不再画。
+
+            要求点在峰附近（横向 ± 图宽的 1/40），否则不动 —— 自动峰往往很多，
+            不加这道距离判断，在空白处随手一右键就会误删一个峰。
+            """
+            path, mlst = self._manual_list()
+            hpath, hlst = self._hidden_list()
+            if mlst is None or hlst is None or path != hpath:
+                self.info_var.set(T("删除峰标注请只选择 1 个文件"))
+                return
+            if not self._view or not self._view_series or event is None:
+                return
+            v = self._view
+            xs = self._view_series[0][1]
+            ys = self._view_series[0][2]
+            if not xs:
+                return
+            plot = self.current_plot_options()
+            peaks = analyze_peaks(xs, ys, plot, processed=True)
+            if not peaks:
+                self.info_var.set(T("图上没有可删除的标注峰"))
+                return
+            data_x = v["xmin"] + (event.x - v["ml"]) / v["pw"] * (v["xmax"] - v["xmin"])
+            span = v["xmax"] - v["xmin"]
+            near = min(peaks, key=lambda pk: abs(pk["x"] - data_x))
+            if abs(near["x"] - data_x) > max(1e-9, span / 40.0):
+                self.info_var.set(T("附近没有峰，请点在峰上再右键"))
+                return
+            px = near["x"]
+            tol = max(1.0, abs(float(plot["peak_min_dist"])) / 2.0)
+            if near.get("manual"):
+                for q in list(mlst):
+                    if abs(q - px) <= tol:
+                        mlst.remove(q)
+                self._log(T("已删除手动峰：%.2f（剩余 %d 个）") % (px, len(mlst)))
+            else:
+                if all(abs(px - q) > tol for q in hlst):
+                    hlst.append(px)
+                    hlst.sort()
+                self._log(T("已删除自动峰：%.2f（该文件共隐藏 %d 个）") % (px, len(hlst)))
+            self.preview_selected()
+
+        def restore_hidden_peaks(self):
+            """把当前文件里被右键删掉的自动峰全部恢复回来。"""
+            path, hlst = self._hidden_list()
+            if hlst is None:
+                return
+            if not hlst:
+                self.info_var.set(T("当前文件没有被删除的自动峰"))
+                return
+            n = len(hlst)
+            hlst.clear()
+            self.preview_selected()
+            self._log(T("已恢复 %d 个被删除的自动峰。") % n)
 
         def clear_manual_peaks(self):
             path, lst = self._manual_list()
@@ -6852,9 +7039,38 @@ def _run_gui():
             win = tk.Toplevel(self)
             win.title("高级设置 · 处理 / 校准 / 坐标轴 / 峰 / 图幅")
             win.transient(self)
-            win.resizable(False, False)
             adv = self.adv_values
             vars_ = {}
+
+            # 底部按钮条先占位：小屏 / 高 DPI 下内容再长，按钮也不会被顶出屏幕。
+            btns = ttk.Frame(win)
+            btns.pack(side="bottom", fill="x", padx=10, pady=(6, 10))
+
+            # 其余内容放进可滚动区，一屏放不下就滚，而不是把窗口撑到屏幕外。
+            body = ttk.Frame(win)
+            body.pack(side="top", fill="both", expand=True)
+            canvas = tk.Canvas(body, borderwidth=0, highlightthickness=0)
+            vbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=vbar.set)
+            vbar.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+            inner = ttk.Frame(canvas)
+            inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+            def _sync_scrollregion(_event=None):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+            def _fit_width(event):
+                canvas.itemconfigure(inner_id, width=event.width)
+
+            def _on_wheel(event):
+                canvas.yview_scroll(-1 if getattr(event, "delta", 0) > 0 else 1, "units")
+
+            inner.bind("<Configure>", _sync_scrollregion)
+            canvas.bind("<Configure>", _fit_width)
+            # 滚轮：子控件不处理本事件时会向上冒泡到 inner / canvas，各挂一次即可
+            inner.bind("<MouseWheel>", _on_wheel)
+            canvas.bind("<MouseWheel>", _on_wheel)
 
             def add_entry(parent, label, key, row, hint="", width=9):
                 ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=3)
@@ -6878,14 +7094,14 @@ def _run_gui():
                     row=row, column=1, sticky="w", padx=4, pady=3)
                 return var, {v: k for k, v in shown.items()}
 
-            axes = ttk.LabelFrame(win, text="坐标轴范围（留空 = 自动）")
+            axes = ttk.LabelFrame(inner, text="坐标轴范围（留空 = 自动）")
             axes.grid(row=0, column=0, sticky="we", padx=10, pady=(10, 4))
             add_entry(axes, "横坐标最小值：", "x_min", 0)
             add_entry(axes, "横坐标最大值：", "x_max", 1)
             add_entry(axes, "纵坐标最小值：", "y_min", 2)
             add_entry(axes, "纵坐标最大值：", "y_max", 3)
 
-            proc = ttk.LabelFrame(win, text="光谱处理（默认仅用于出图与峰识别）")
+            proc = ttk.LabelFrame(inner, text="光谱处理（默认仅用于出图与峰识别）")
             proc.grid(row=1, column=0, sticky="we", padx=10, pady=4)
             dsp = tk.BooleanVar(value=bool(adv.get("despike")))
             ttk.Checkbutton(proc, text="尖峰去除（宇宙射线 / 坏点）", variable=dsp).grid(
@@ -6915,14 +7131,14 @@ def _run_gui():
             ttk.Checkbutton(proc, text="同时应用到导出的数据（CSV/Excel）", variable=avar).grid(
                 row=13, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
 
-            cal = ttk.LabelFrame(win, text="拉曼位移校准（实测峰位 → 标准峰位，留空 = 不校准）")
+            cal = ttk.LabelFrame(inner, text="拉曼位移校准（实测峰位 → 标准峰位，留空 = 不校准）")
             cal.grid(row=2, column=0, sticky="we", padx=10, pady=4)
             add_entry(cal, "第1对 实测/标准：", "calib_a", 0, hint="例 520.6 → 520.7")
             add_entry(cal, "对应标准值：", "calib_b", 1)
             add_entry(cal, "第2对 实测：", "calib_a2", 2, hint="两点校准才需填")
             add_entry(cal, "对应标准值：", "calib_b2", 3)
 
-            peak = ttk.LabelFrame(win, text="峰识别与峰拟合")
+            peak = ttk.LabelFrame(inner, text="峰识别与峰拟合")
             peak.grid(row=3, column=0, sticky="we", padx=10, pady=4)
             add_entry(peak, "峰灵敏阈值(%)：", "peak_thresh_pct", 0, hint="占强度范围，越小越灵敏")
             sh_labels = {"gaussian": "高斯", "lorentzian": "洛伦兹", "voigt": "伪Voigt"}
@@ -6930,8 +7146,12 @@ def _run_gui():
             rvar = tk.BooleanVar(value=bool(adv.get("peak_label_rel")))
             ttk.Checkbutton(peak, text="峰标签同时显示相对强度(%)", variable=rvar).grid(
                 row=2, column=0, columnspan=3, sticky="w", padx=8, pady=3)
+            dashvar = tk.BooleanVar(value=bool(adv.get("peak_dash_line", True)))
+            ttk.Checkbutton(peak, text="峰位虚线引到横坐标轴（自动峰 + 手动峰）",
+                            variable=dashvar).grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=8, pady=3)
 
-            fig = ttk.LabelFrame(win, text="图幅（PNG 输出像素）")
+            fig = ttk.LabelFrame(inner, text="图幅（PNG 输出像素）")
             fig.grid(row=4, column=0, sticky="we", padx=10, pady=4)
             add_entry(fig, "宽：", "fig_width", 0)
             add_entry(fig, "高：", "fig_height", 1)
@@ -6978,17 +7198,31 @@ def _run_gui():
                 adv["peak_thresh_pct"] = to_float(vars_["peak_thresh_pct"], 7.0)
                 adv["fit_shape"] = shinv.get(shvar.get(), "voigt")
                 adv["peak_label_rel"] = bool(rvar.get())
+                adv["peak_dash_line"] = bool(dashvar.get())
                 adv["fig_width"] = to_int(vars_["fig_width"], 1600, 200)
                 adv["fig_height"] = to_int(vars_["fig_height"], 900, 200)
                 if close:
                     win.destroy()
                 self.preview_selected()
 
-            btns = ttk.Frame(win)
-            btns.grid(row=5, column=0, sticky="e", padx=10, pady=(6, 10))
             ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
             ttk.Button(btns, text="应用", command=lambda: apply(False)).pack(side="right", padx=6)
             ttk.Button(btns, text="确定", command=lambda: apply(True)).pack(side="right")
+
+            # 尺寸：内容有多高就给多高，但绝不超出屏幕可用高度；
+            # 超出部分靠滚动，按钮条固定在底部始终可点。
+            win.update_idletasks()
+            need_w = max(inner.winfo_reqwidth(), 560)
+            need_h = inner.winfo_reqheight() + btns.winfo_reqheight() + 30
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            w = min(need_w + 30, int(sw * 0.92))
+            h = min(need_h, int(sh * 0.85))
+            _sync_scrollregion()
+            win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2),
+                                          max(0, (sh - h) // 2 - 20)))
+            win.minsize(min(w, 460), min(h, 300))
+            win.resizable(True, True)
 
         def _refresh_preview(self):
             if self._refresh_job:
@@ -7174,10 +7408,10 @@ def _run_gui():
             for src in paths:
                 try:
                     plot = base_plot
-                    manual = self.manual_peaks.get(os.path.abspath(src))
-                    if manual:
+                    ov = self._peak_overrides(src)
+                    if ov:
                         plot = dict(base_plot)
-                        plot["manual_peaks"] = manual
+                        plot.update(ov)
                     dst, nser = convert_csv_to_png(src, out_dir=out_dir, plot=plot)
                     self._log(T("CSV → PNG：%s（%d 列）") % (os.path.basename(dst), nser))
                     ok += 1
@@ -7942,19 +8176,23 @@ def _run_gui():
                             continue
                         gx = sx(pk["x"])
                         gy = sy(pk["y"])
+                        mark_color = "#1450aa" if pk.get("manual") else "#aa1e1e"
+                        # 峰位波长虚线：从峰顶引到横坐标轴（自动峰和手动峰一视同仁）
+                        if p["peak_dash_line"]:
+                            cv.create_line(gx, gy, gx, mt + ph, fill=mark_color,
+                                           dash=(3, 3))
                         if pk.get("manual"):
                             cv.create_rectangle(gx - 4, gy - 4, gx + 4, gy + 4,
                                                 fill="#1e6ec8", outline="")
-                            mark_color = "#1450aa"
                         else:
                             cv.create_oval(gx - 3, gy - 3, gx + 3, gy + 3,
                                            fill="#c83232", outline="")
-                            mark_color = "#aa1e1e"
                         text = ("%g  %.0f%%" % (round(pk["x"], 1), pk["rel"])
                                 if p["peak_label_rel"] else "%g" % round(pk["x"], 1))
                         ly = gy - (9, 25, 41)[k % 3]
-                        cv.create_text(gx, ly, text=text, fill=mark_color,
-                                       font=("Microsoft YaHei UI", 8), anchor="s")
+                        if p["peak_labels"]:
+                            cv.create_text(gx, ly, text=text, fill=mark_color,
+                                           font=("Microsoft YaHei UI", 8), anchor="s")
 
             if title and p["show_title"]:
                 cv.create_text(ml + pw / 2, mt - 20, text=title, fill="#222",
@@ -8021,21 +8259,26 @@ def _run_gui():
             self.run_btn.configure(state="disabled")
             self.progress.configure(maximum=len(self.files), value=0)
             self._log("=" * 48)
+            peak_map = {}
+            for p in self.files:
+                ov = self._peak_overrides(p)
+                if ov:
+                    peak_map[self._peak_key(p)] = ov
             self.worker = threading.Thread(
-                target=self._work, args=(list(self.files), opts, dict(self.manual_peaks)),
+                target=self._work, args=(list(self.files), opts, peak_map),
                 daemon=True)
             self.worker.start()
 
-        def _work(self, files, opts, manual_map):
+        def _work(self, files, opts, peak_map):
             ok, skip, fail = 0, 0, 0
             for i, src in enumerate(files, 1):
                 try:
-                    manual = manual_map.get(src)
+                    ov = peak_map.get(self._peak_key(src)) or {}
                     if src.lower().endswith(".csv"):
                         plot = opts.get("plot")
-                        if manual:
+                        if ov:
                             plot = dict(plot or {})
-                            plot["manual_peaks"] = manual
+                            plot.update(ov)
                         dst, nser = convert_csv_to_png(src, out_dir=opts.get("out_dir"),
                                                        plot=plot)
                         msg = "(%d/%d) ✔ %s  →  %s   [CSV→PNG, %d 列]" % (
@@ -8043,10 +8286,10 @@ def _run_gui():
                         ok += 1
                     else:
                         file_opts = opts
-                        if manual:
+                        if ov:
                             file_opts = dict(opts)
                             plot = dict(opts.get("plot") or {})
-                            plot["manual_peaks"] = manual
+                            plot.update(ov)
                             file_opts["plot"] = plot
                         dst, spec, skipped = convert_file(src, **file_opts)
                         if skipped:
@@ -8938,6 +9181,73 @@ def _run_gui():
             self._log(T("瀑布图：%s") % os.path.basename(dst))
             self._show_image(dst, T("瀑布图（%d 条）") % len(specs))
 
+        def tool_overlay(self):
+            specs = self._selected_spectra()
+            if len(specs) < 2:
+                messagebox.showinfo("提示", "多数据图叠加需要选中至少 2 条光谱。")
+                return
+            n = len(specs)
+            win = tk.Toplevel(self)
+            win.title("多数据图叠加")
+            win.transient(self)
+            win.resizable(False, False)
+            ttk.Label(win, text="把选中的 %d 条光谱叠画在同一套坐标轴上，每条一种颜色。" % n,
+                      font=("Microsoft YaHei UI", 10, "bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+            nvar = tk.BooleanVar(value=True)
+            ttk.Checkbutton(win, text="各条归一化到最大值 = 1（便于比较谱型）",
+                            variable=nvar).grid(row=1, column=0, columnspan=2,
+                                                sticky="w", padx=12, pady=3)
+            avar = tk.BooleanVar(value=bool(self.annotate_peaks.get()))
+            ttk.Checkbutton(win, text="标注峰位（峰位带波长虚线）",
+                            variable=avar).grid(row=2, column=0, columnspan=2,
+                                                sticky="w", padx=12, pady=3)
+            lvar = tk.BooleanVar(value=bool(self.peak_labels.get()))
+            ttk.Checkbutton(win, text="显示峰位数值（取消勾选只留虚线与标记）",
+                            variable=lvar).grid(row=3, column=0, columnspan=2,
+                                                sticky="w", padx=12, pady=3)
+            tvar = tk.BooleanVar(value=bool(self.show_title.get()))
+            ttk.Checkbutton(win, text="标题", variable=tvar).grid(
+                row=4, column=0, columnspan=2, sticky="w", padx=12, pady=3)
+            lo, hi = overlay_range(specs)
+            rng = ""
+            if lo is not None and hi is not None:
+                rng = "（%.1f ~ %.1f cm-1）" % (lo, hi)
+            ttk.Label(win, text="横坐标取各条谱波数范围的交集%s" % rng,
+                      foreground="#777").grid(row=5, column=0, columnspan=2,
+                                              sticky="w", padx=12, pady=(2, 0))
+            if n > 12:
+                ttk.Label(win, text="曲线超过 12 条，图例只列出前 12 条。",
+                          foreground="#8a6d1a").grid(
+                    row=6, column=0, columnspan=2, sticky="w", padx=12, pady=(2, 0))
+            status = tk.StringVar(value="")
+            ttk.Label(win, textvariable=status, foreground="#1a4a8a").grid(
+                row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 8))
+
+            def run():
+                src = self.files[self.listbox.curselection()[0]]
+                out = self._tool_out_dir(src)
+                dst = os.path.join(out, "叠加图_%d条.png" % n)
+                plot = self.plot_options()
+                plot["annotate_peaks"] = bool(avar.get())
+                plot["peak_labels"] = bool(lvar.get())
+                plot["show_title"] = bool(tvar.get())
+                ylab = T("归一化强度") if nvar.get() else T("强度")
+                try:
+                    render_overlay(dst, specs, T("多数据图叠加（%d 条）") % n,
+                                   _DEFAULT_X_HEADER, ylab, plot,
+                                   normalize=bool(nvar.get()))
+                except Exception as exc:
+                    status.set(T("生成失败：%s") % exc)
+                    return
+                self._log(T("叠加图：%s") % os.path.basename(dst))
+                self._show_image(dst, T("多数据图叠加（%d 条）") % n)
+
+            row = ttk.Frame(win)
+            row.grid(row=8, column=0, columnspan=2, sticky="e", padx=12, pady=(0, 12))
+            ttk.Button(row, text="生成并导出", command=run).pack(side="right")
+            ttk.Button(row, text="关闭", command=win.destroy).pack(side="right", padx=6)
+
         def tool_replace(self):
             specs = self._selected_spectra()
             if len(specs) < 2:
@@ -9328,7 +9638,7 @@ def _run_gui():
     app.mainloop()
 
 
-_MANUAL_VERSION = "2.0"
+_MANUAL_VERSION = "2.1"
 _MANUAL_TITLE = "拉曼光谱工具 · 使用说明书"
 _MANUAL_MARKER = "（说明书版本：%s）" % _MANUAL_VERSION
 _MANUAL_MARKER_EN = "(guide version: %s)" % _MANUAL_VERSION
@@ -9435,7 +9745,7 @@ k 值：||k value:
 峰标签同时显示相对强度(%)||Show relative intensity (%) with peak labels
 峰识别与峰拟合||Peak detection and fitting
 工具自身的数据（下载的参考谱、RRUFF 数据包、分析结果）统一保存在：||All tool data (downloaded references, RRUFF packages, analysis results) is kept in:
-左键点图=补标峰，右键=删除最近手动峰||Left-click the plot = add a peak, right-click = remove the nearest manual peak
+左键点图=补标峰，右键=删掉最近的峰（自动 / 手动都可）||Left-click the plot = add a peak, right-click = delete the nearest peak (auto or manual)
 帮助||Help
 平均所选光谱||Average selected spectra
 应用||Apply
@@ -9681,7 +9991,7 @@ CSV → PNG：%s（%d 列）||CSV -> PNG: %s (%d columns)
 CSV 转图片完成，共 %d 个。||CSV to image finished, %d file(s).
 RRUFF 按矿物抓取 "%s"：命中 %d 条，导出 %d 条到 %s||RRUFF bulk fetch "%s": %d hit, exported %d to %s
 ① 可读：.jws / .csv / .spc / .jdx / .txt / .xlsx；可出 Excel(图表) / PNG / CSV / 峰列表 / 峰拟合 / JCAMP-DX。||1. Reads .jws / .csv / .spc / .jdx / .txt / .xlsx; outputs Excel (chart) / PNG / CSV / peak list / peak fit / JCAMP-DX.
-② 漏标的峰：在右侧图上左键点击即可手动补标（蓝色方块），右键删除。||2. Missed peaks: left-click the plot to add one (blue square), right-click to remove.
+② 漏标的峰：在右侧图上左键点击即可手动补标（蓝色方块）；标错的峰（含自动峰）对准它右键即可删掉。||2. Missed peaks: left-click the plot to add one (blue square); to drop a wrong peak, including automatic ones, right-click on it.
 ③ 菜单“分析工具”：未知光谱检索（全库鉴定）/ 峰拟合 / 比对 / 峰位检索 /||3. "Analysis" menu: unknown-spectrum search (whole library) / peak fitting / compare / peak-position search /
 ④ 菜单“文件”：文件夹批处理、导出分析报告；菜单“设置”：高级设置（含尖峰去除、||4. "File" menu: batch folder, export analysis report; "Settings" menu: advanced settings (spike removal,
 ⑤ 数据文件夹：%s||5. Data folder: %s
@@ -9712,6 +10022,18 @@ RRUFF 按矿物抓取 "%s"：命中 %d 条，导出 %d 条到 %s||RRUFF bulk fet
 已清空「%s」：删除 %d 项。||Cleared "%s": %d item(s) deleted.
 已清空该文件的手动标注。||Cleared the manual annotations of this file.
 已移除手动峰，剩余 %d 个。||Manual peak removed, %d left.
+已删除手动峰：%.2f（剩余 %d 个）||Manual peak deleted: %.2f (%d left)
+已删除自动峰：%.2f（该文件共隐藏 %d 个）||Automatic peak deleted: %.2f (%d hidden for this file)
+已恢复 %d 个被删除的自动峰。||Restored %d deleted automatic peaks.
+当前文件没有被删除的自动峰||No deleted automatic peaks for the current file.
+图上没有可删除的标注峰||There is no annotated peak to delete on the chart.
+附近没有峰，请点在峰上再右键||No peak nearby - click on a peak first, then right-click.
+删除峰标注请只选择 1 个文件||Select exactly 1 file to delete peak annotations.
+显示峰位数值||Show peak values
+显示峰位数值（取消勾选只留虚线与标记）||Show peak values (untick to keep only the dashed lines and markers)
+横坐标取各条谱波数范围的交集%s||X axis uses the intersection of every spectrum's wavenumber range %s
+恢复自动峰||Restore auto peaks
+恢复被删的自动峰||Restore deleted automatic peaks
 平均完成（%d 条，%d 点）→ %s||Average done (%d spectra, %d points) -> %s
 手动标注峰：%.2f（共 %d 个）||Manual peak: %.2f (%d total)
 打开图片失败：%s||Cannot open the image: %s
@@ -9728,6 +10050,21 @@ RRUFF 按矿物抓取 "%s"：命中 %d 条，导出 %d 条到 %s||RRUFF bulk fet
 正在聚类分析（%d 条光谱，重采样 300 点）…||Clustering (%d spectra, resampled to 300 points)...
 清理失败 %s：%s||Cleanup failed %s: %s
 瀑布图：%s||Waterfall: %s
+叠加图：%s||Overlay: %s
+叠加图（%d 条）||Overlay (%d spectra)
+多数据图叠加（%d 条）||Multi-dataset overlay (%d spectra)
+ERR 叠加图 -> %s||ERR overlay -> %s
+叠加图至少需要 2 条光谱，已跳过。||The overlay needs at least 2 spectra; skipped.
+多数据图叠加（所选光谱）…||Multi-dataset overlay (selected spectra)…
+多数据图叠加||Multi-dataset overlay
+多数据图叠加需要选中至少 2 条光谱。||The overlay needs at least 2 spectra.
+把选中的 %d 条光谱叠画在同一套坐标轴上，每条一种颜色。||Overlay the %d selected spectra on shared axes, one colour per dataset.
+各条归一化到最大值 = 1（便于比较谱型）||Normalize each curve to max = 1 (easier to compare shapes)
+标注峰位（峰位带波长虚线）||Annotate peaks (with wavelength dashed lines)
+曲线超过 12 条，图例只列出前 12 条。||More than 12 curves: the legend lists only the first 12.
+生成并导出||Render and export
+生成失败：%s||Render failed: %s
+峰位虚线引到横坐标轴（自动峰 + 手动峰）||Draw a dashed line from each peak down to the x axis (auto + manual peaks)
 特征索引：%s -> %d 条||Feature index: %s -> %d entries
 相似度矩阵（%d×%d）→ %s||Similarity matrix (%dx%d) -> %s
 相减完成：A=%s  B=%s（%d 点）→ %s||Subtraction done: A=%s  B=%s (%d points) -> %s
@@ -10454,16 +10791,17 @@ _MANUAL_SECTIONS = [
 右侧（光谱预览）
   预览选中文件  打开 CSV 看图  CSV→图片  保存为 PNG  清空视图
   图表设置：横坐标刻度间隔、起始刻度、显示纵坐标数值、网格线、
-            标题、标注峰位、最小峰间距(cm-1)、高级设置…
-  撤销手动峰 / 清空手动峰
-  下方大图 = 画布，左键点图补标峰、右键删除手动峰
+            标题、标注峰位、显示峰位数值、最小峰间距(cm-1)、高级设置…
+  撤销手动峰 / 清空手动峰 / 恢复自动峰
+  下方大图 = 画布，左键点图补标峰、右键删掉最近的峰（自动 / 手动都可）
 
 顶部菜单
   文件     添加文件 / 添加文件夹 / 批处理文件夹… / 导出分析报告… / 退出
   分析工具 未知光谱检索（全库鉴定）、配对比较、峰拟合、峰位检索、
            相似度矩阵、聚类分析、二维成像、平均、相减、交互式相减、
-           谱段替换、瀑布图、光谱比对
-  设置     高级设置… / 矿物信息与拉曼峰归属库… / 数据文件夹… / 清空手动峰
+           谱段替换、瀑布图、多数据图叠加、光谱比对
+  设置     高级设置… / 矿物信息与拉曼峰归属库… / 数据文件夹… /
+           清空手动峰标注 / 恢复被删的自动峰
   数据库   在线检索、RRUFF 数据源、本地库比对、打开数据文件夹
   帮助     使用说明（完整手册）… / 关于"""),
 
@@ -10541,16 +10879,35 @@ _MANUAL_SECTIONS = [
   显示纵坐标数值   默认关闭（拉曼强度是相对值，隐藏更清爽）
   网格线 / 标题    按需开关
   标注峰位         自动识别并标注峰位
+  显示峰位数值     默认开启；取消勾选后峰位数字不再画出，
+                   但峰位标记与虚线还在，适合谱线密集时看走势
   最小峰间距(cm-1) 默认 20，太小会把噪声当峰
   高级设置…        预处理、校准、峰、图幅都在里面（见第 7、15 章）
 
+峰位波长虚线
+  自动标注的峰和手动补标的峰，都会从峰顶往下画一条虚线引到横坐标轴，
+  一眼就能读出这个峰对应的波数。不想显示就去
+  【设置】→【高级设置…】→“峰识别与峰拟合”，取消勾选
+  “峰位虚线引到横坐标轴”（命令行 --no-peak-dash）。
+
 手动补标峰（自动漏掉的峰）
   · 在图上左键点一下 = 补标一个峰（蓝色方块，会自动吸附到峰顶）
-  · 右键 = 删除最近手动补的峰
-  · 点【撤销手动峰】/【清空手动峰】批量处理
   · 每个文件单独记忆，导出峰列表与出图时一并标注
   · 手动峰在峰列表里“来源”列显示为“手动”
+  · 点【撤销手动峰】撤销最后补的那个，【清空手动峰】一次清光
   · 也可以命令行一次给多个峰位：--manual 1007,974
+
+删除不想要的峰（自动标错的也能删）
+  · 在图上对准某个峰右键 = 删掉离鼠标最近的那个峰，
+    自动峰（红色圆点）和手动峰（蓝色方块）都适用
+  · 自动峰不会真的“消失”，而是记进该文件的“已删除”名单，
+    出图、峰列表、导出都按删除后的结果算；
+    峰位删除要求点在峰附近（横向约 ±1/40 图宽），
+    否则只是提示“附近没有峰”，避免在空白处误删
+  · 点【恢复自动峰】把该文件删掉的自动峰一次全恢复
+    （菜单【设置】→【恢复被删的自动峰】同样效果）
+  · 手动峰被删掉就是真的移除了，用【撤销手动峰】或重新左键点回来
+  · 每个文件各记各的，删错了随时能恢复
 
 保存图片：点【保存为 PNG】；或直接勾选输出内容“PNG 图片”。
 把 CSV 当图看：点【打开 CSV 看图】，再用【保存为 PNG】存图。"""),
@@ -10768,6 +11125,21 @@ _MANUAL_SECTIONS = [
   多条光谱归一化后纵向错开堆叠，便于横向比较谱型（菜单里一键出图，
   命令行加 --waterfall）。
 
+多数据图叠加
+  菜单【分析工具】→【多数据图叠加（所选光谱）…】，命令行加 --overlay。
+  与瀑布图不同：叠加图不做上下错开，所有数据集压在同一套坐标轴上，
+  每条数据集一种颜色，看的是“谱型像不像”而不是“有哪些峰”。
+    · 横坐标取所有数据图波数范围的**交集** —— 只比大家都有数据的波段，
+      某条谱短一截时右边就不会空出一段白。对话框里会写明实际取到的范围。
+      若在【高级设置】里手动填过横坐标范围，则以手动的为准。
+    · 默认各条归一化到最大值 = 1，强度差很多也能看清形状；
+      取消勾选则按原始强度叠画，用来看真实的相对强弱。
+    · 可勾选是否标注峰位；勾上时每个峰会画一条虚线引到横坐标轴。
+    · 可取消勾选“显示峰位数值”，只留虚线和标记 —— 十几条谱叠在一起时，
+      数字会糊成一片，关掉更清爽（同样受主界面【显示峰位数值】影响）。
+    · 右侧图例标出每条曲线的来源文件名（最多列 12 条）。
+  导出为 叠加图_N条.png，存放在分析结果目录。
+
 光谱比对（参考谱文件）
   选一个参考谱，算相关系数与谱角，快速看像不像。"""),
 
@@ -10841,7 +11213,8 @@ _MANUAL_SECTIONS = [
 
 峰识别与峰拟合
   峰灵敏阈值(%)、拟合峰形（高斯/洛伦兹/伪Voigt）
-  ☐ 峰标签同时显示相对强度(%)
+  ☑ 峰标签同时显示相对强度(%)
+  ☑ 峰位虚线引到横坐标轴（自动峰 + 手动峰）
 
 图幅
   PNG 输出宽 / 高（默认 1600×900）
@@ -10856,12 +11229,13 @@ _MANUAL_SECTIONS = [
   --png / --xlsx / --csv / --peaks / --fit / --jcamp
   某文件夹                      递归转换
   --waterfall 文件夹            瀑布图
+  --overlay 文件夹              多数据图叠加（每条一色）
   --out 输出目录                指定输出位置
 
 出图参数
   --x-step 200 --x-start 0 --x-min --x-max --y-min --y-max
-  --y-ticks --no-grid --no-title --no-peaks
-  --peak-dist 20 --peak-thresh 7 --peak-label-rel
+  --y-ticks --no-grid --no-title --no-peaks --no-peak-dash
+  --no-peak-labels --peak-dist 20 --peak-thresh 7 --peak-label-rel
   --fig-width 1600 --fig-height 900 --manual 1007,974
 
 预处理与归属
@@ -11091,10 +11465,18 @@ Why does the CSV I double-clicked in WPS show only numbers, no chart?
   is missing the tool tells you how to install it (pip install openpyxl).
 
 Peaks were missed
-  Right-click behaviour: left-click on the chart adds a peak manually (blue
-  square), right-click removes the nearest manual peak. Manual peaks are
+  Left-click on the chart adds a peak manually (blue square). Manual peaks are
   remembered per file and appear in the peak list with source "manual".
-  You can also lower the peak sensitivity threshold in [Advanced settings...]."""),
+  You can also lower the peak sensitivity threshold in [Advanced settings...].
+
+Peaks were detected that should not be there
+  Right-click on the peak to delete it - this works for automatic peaks (red
+  dots) as well as manual ones. A deleted automatic peak goes onto a per-file
+  "deleted" list and is left out of the chart, the peak table and every export.
+  Click near the peak (about +-1/40 of the chart width) or the tool will only
+  report that no peak is nearby, so right-clicking on empty space never deletes
+  anything. [Restore auto peaks] (also under [Settings]) brings them all back,
+  and the list is per file, so nothing is unrecoverable."""),
 
     ("2. Interface overview", """The window is split in two: operations on the left, charts on the right.
 
@@ -11109,7 +11491,8 @@ Left side
 
 Right side
   [Chart settings]   X tick interval (integer, 200 by default), start tick,
-                     hide Y values, grid lines, title, figure size
+                     hide Y values, grid lines, title, figure size, show peak
+                     values, undo / clear manual peaks, restore auto peaks
   Spectrum preview   up to 8 curves overlaid, [Clear view]
   [Save preview as PNG]  saves the current view
 
@@ -11118,9 +11501,10 @@ Menu bar
   Analysis  unknown-spectrum search (whole-library identification), peak
             fitting, compare, peak-position search, similarity matrix,
             clustering, 2D imaging, average, subtract, range replacement,
-            waterfall, spectrum comparison
+            waterfall, multi-dataset overlay, spectrum comparison
   Settings  advanced settings..., mineral info and Raman peak assignment...,
-            data folder..., language
+            data folder..., clear manual peak annotations, restore deleted
+            automatic peaks, language
   Database  search online databases (ROD / RRUFF)..., RRUFF data sources...,
             open data folders
   Help      guide (full manual)..., export the guide as TXT..., about"""),
@@ -11209,13 +11593,37 @@ Command line
   Figure size       PNG pixels, 1600x900 by default
   Peak labels       label every detected peak; optionally show relative
                     intensity (%) next to the wavenumber
+  Show peak values  on by default; untick it and the wavenumber numbers are no
+                    longer drawn while the markers and dashed lines stay - handy
+                    when many curves are on the chart
+
+Peak wavelength dashed lines
+  Every annotated peak - detected automatically or added by hand - also gets a
+  dashed line from the peak top straight down to the x axis, so the wavenumber
+  of the peak can be read off at a glance. To hide them, untick "draw a dashed
+  line from each peak down to the x axis (auto + manual peaks)" under
+  [Settings -> Advanced settings...] -> "Peak detection and fitting"
+  (command line: --no-peak-dash).
 
 Manual annotation
   Left-click the chart   add a peak at the nearest peak top (blue square)
-  Right-click            remove the nearest manual peak
+  [Undo manual peak]     remove the last one you added
   [Clear manual peaks]   remove them all for the current file
-  [Undo manual peak]     remove the last one
   Manual peaks are kept per file and are marked "manual" in the peak list.
+
+Deleting peaks you do not want (including wrong automatic ones)
+  Right-click on a peak deletes the annotated peak nearest to the pointer -
+  both automatic peaks (red dots) and manual ones (blue squares).
+  An automatic peak is not really "gone": its position goes onto a per-file
+  "deleted" list, and the chart, the peak table and every export are then
+  computed without it. You must click near the peak (about +-1/40 of the chart
+  width); otherwise the tool just says no peak is nearby, so that a stray
+  right-click on empty space cannot delete anything.
+  [Restore auto peaks] puts every deleted automatic peak of that file back
+  (same as [Settings -> Restore deleted automatic peaks]).
+  A deleted manual peak is removed for real - add it back with a left-click or
+  use [Undo manual peak].
+  The lists are per file, so a mistake is always undoable.
 
 When a peak sits on a shoulder, the tool estimates its prominence against a
 local baseline so that the annotation and the table stay sensible."""),
@@ -11402,6 +11810,31 @@ Pairing (manual / automatic)
                                spectrum with the matching range of another
                                spectrum, with a linear transition at the edges
   Waterfall                    many spectra stacked with a vertical offset
+  Multi-dataset overlay        [Analysis -> Multi-dataset overlay (selected
+                               spectra)...] or --overlay on the command line.
+                               No vertical offset: every dataset is drawn on the
+                               same axes, one colour per dataset, so you compare
+                               spectral shapes rather than peak lists.
+                                 . the x axis uses the INTERSECTION of every
+                                   dataset's wavenumber range, so a shorter
+                                   spectrum does not leave a blank strip on the
+                                   right; the dialog states the range it used.
+                                   An explicit range in [Advanced settings...]
+                                   still wins.
+                                 . each curve is normalized to max = 1 by
+                                   default; untick it to keep raw intensities
+                                   and compare real relative strengths
+                                 . peak annotation is optional; when enabled,
+                                   every peak gets a dashed line down to the
+                                   x axis
+                                 . untick "show peak values" to drop the
+                                   numbers and keep only the dashed lines and
+                                   markers - much clearer with a dozen curves
+                                   (the main panel's "Show peak values" does
+                                   the same)
+                                 . the legend names the source file of each
+                                   curve (first 12 at most)
+                               Exported as 叠加图_N条.png into the results folder.
   Compare with a reference     compare one spectrum with a single reference
   Pairing with the local library  compare against every spectrum in 参考谱库
 
@@ -11447,7 +11880,9 @@ Analysis report
                     pairs; the second pair is only needed for two-point scaling)
   Peaks             sensitivity threshold (% of the intensity range, smaller is
                     more sensitive), minimum separation (cm-1), peak shape for
-                    fitting, assignment reference mineral
+                    fitting, assignment reference mineral, "show relative
+                    intensity with peak labels", "draw a dashed line from each
+                    peak down to the x axis (auto + manual peaks)"
   Figure size       PNG pixels
 
   "Also apply to exported data" decides whether preprocessing is written into
@@ -11461,12 +11896,15 @@ Conversion
   jws2csv.py folder --png --peaks       whole folder, PNG + peak list
   jws2csv.py --xlsx --out D:\\out a.jws  Excel with chart into a folder
   jws2csv.py --skip-existing            never overwrite existing CSV
+  jws2csv.py --waterfall folder         stacked waterfall chart
+  jws2csv.py --overlay folder           overlaid chart, one colour per dataset
 
 Processing (same names as the advanced settings)
   --despike --baseline iterative --order 5 --iters 20
   --smooth sg --window 7 --savgol-order 2
   --deriv 1 --norm max --calib 520.6:520.7
   --x-min 100 --x-max 2000 --tick 200 --fig-w 1600 --fig-h 900
+  --no-peaks --no-peak-dash --no-peak-labels
   --header-custom "Wavenumber,Intensity"
 
 Analysis
