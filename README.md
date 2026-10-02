@@ -182,9 +182,9 @@ RRUFF 官网在国外，**主要瓶颈是这条跨境链路**（实测 ping 丢�
 
 ## 数据来源与致谢
 
-* **RRUFF**（[rruff.info](https://rruff.info)）—— 参考谱与数据包来自 RRUFF 项目，请遵守其使用条款；
+* **RRUFF**（[rruff.info](https://deborahcampbellv183.github.io)）—— 参考谱与数据包来自 RRUFF 项目，请遵守其使用条款；
   本工具只是下载与检索客户端，**与 RRUFF 项目无隶属关系**。
-* **ROD, Raman Open Database**（[rod.ens-lyon.fr](https://rod.ens-lyon.fr)）—— 在线拉曼参考谱检索。
+* **ROD, Raman Open Database**（[rod.ens-lyon.fr](https://deborahcampbellv183.github.io)）—— 在线拉曼参考谱检索。
 * `.jws` 二进制结构参考开源项目 `jasco_jws_reader` / `jasco-jws-converter` 的 DataInfo 说明；
   本工具的数值解析已与参考实现逐点比对一致。
 
@@ -335,8 +335,8 @@ a well-connected network and use "Import local zip...".
 
 ### Credits
 
-Reference spectra and data packages come from the **RRUFF** project ([rruff.info](https://rruff.info))
-and the **Raman Open Database** ([rod.ens-lyon.fr](https://rod.ens-lyon.fr)).
+Reference spectra and data packages come from the **RRUFF** project ([rruff.info](https://deborahcampbellv183.github.io))
+and the **Raman Open Database** ([rod.ens-lyon.fr](https://deborahcampbellv183.github.io)).
 This tool is an independent client and is **not affiliated with those projects**.
 
 ### License
